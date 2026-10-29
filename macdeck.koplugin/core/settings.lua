@@ -15,6 +15,8 @@ M.DEFAULTS = {
     clock = {
         twelve_hour = false,
         location_label = "",
+        -- 空字串 = 自動（例如 "EDT · UTC−04:00"）；Kobo 系統時區不可靠時可手動填，例如 "Detroit time"
+        timezone_label = "",
         full_refresh_min = 30, -- 每 N 分鐘做一次全刷消殘影；0 = 關閉
     },
     idle = { controller_timeout_sec = 60 },

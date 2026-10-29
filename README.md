@@ -41,7 +41,8 @@ kobo-macdeck/
 return {
     config = {
         idle = { controller_timeout_sec = 30 },
-        clock = { location_label = "Ann Arbor" },
+        clock = { location_label = "Ann Arbor" }, -- Clock 顯示「Ann Arbor · EDT · UTC−04:00」
+        -- clock = { timezone_label = "Detroit time" }, -- 自動時區不對時才需要手動填
         transport = { mock_fail_connect = true }, -- 測 Offline 畫面
     },
 }

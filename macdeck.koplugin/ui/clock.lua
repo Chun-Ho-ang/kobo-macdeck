@@ -10,6 +10,7 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
+local Timezone = require("core/timezone")
 local W = require("ui/widgets")
 
 local ClockScreen = W.ScreenBase:extend{
@@ -48,6 +49,13 @@ function ClockScreen:formatDate()
     return os.date("%a %d %b"):upper()
 end
 
+--- 第二行：「地點 · 時區」，沒設地點就只顯示時區
+function ClockScreen:formatZone()
+    local location = self.cfg.clock.location_label
+    local zone = Timezone.label(self.cfg)
+    return location ~= "" and (location .. " · " .. zone) or zone
+end
+
 function ClockScreen:init()
     local m = W.metrics()
     local body_h = m.inner_h - m.header_h - m.footer_h - 2 * m.gap
@@ -70,11 +78,12 @@ function ClockScreen:init()
         LeftContainer:new{ dimen = Geom:new{ w = text_w, h = time_h }, self.time_text },
     }
 
-    local location = self.cfg.clock.location_label
+    self._last_zone = self:formatZone()
+    self.zone_text = W.text(self._last_zone, 18, false, text_w)
     local left_content = VerticalGroup:new{
         align = "left",
         self.time_region,
-        W.text(location ~= "" and location or os.date("%Y-%m-%d"), 18, false, text_w),
+        self.zone_text,
         VerticalSpan:new{ width = m.gap * 2 },
         W.text("Tap to enter Mac Control →", 14, false, text_w),
     }
@@ -135,10 +144,13 @@ end
 function ClockScreen:updateTime(full)
     self.time_text:setText(self:formatTime())
     local date = self:formatDate()
-    if full or date ~= self._last_date then
-        -- 跨日或定期全刷：整頁重畫
+    local zone = self:formatZone()
+    if full or date ~= self._last_date or zone ~= self._last_zone then
+        -- 跨日、時區 / 夏令時間變動、或定期全刷：整頁重畫
         self._last_date = date
+        self._last_zone = zone
         self.date_text:setText(date)
+        self.zone_text:setText(zone)
         UIManager:setDirty(self, full and "full" or "ui")
     else
         UIManager:setDirty(self, function() return "ui", self.time_region.dimen end)

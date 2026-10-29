@@ -13,6 +13,19 @@
 | 啟動方式 | |
 | 存取方式 (SSH / Telnet) | |
 
+## 1b. 時間與時區
+
+MacDeck 的時間直接用 `os.date`（裝置本機時間），時區標籤由 `core/timezone.lua` 計算。Kobo 可能沒有設定系統時區（Nickel 直接把本機時間寫進系統時鐘），這時標籤會顯示 `UTC+00:00`，但時間本身仍是對的。
+
+| 檢查 | 指令 | 結果 |
+|---|---|---|
+| 系統時間與時區 | `date; date -u` | |
+| TZ 環境變數 | `echo $TZ` | |
+| 時區檔 | `ls -l /etc/localtime; cat /etc/TZ` | |
+| MacDeck 顯示的時區標籤 | （看 Clock 畫面） | |
+
+若標籤不對，在設定檔填 `clock.timezone_label`（例如 `"Detroit time"`，不要寫死 `EDT`，否則換季會錯）。
+
 ## 2. 備份清單
 
 - [ ] `.adds/koreader/settings.reader.lua`

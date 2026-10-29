@@ -92,6 +92,23 @@ test("settings merge + validate", function()
     eq(#Settings.DEFAULTS.buttons, 9, "defaults untouched")
 end)
 
+local Timezone = require("core/timezone")
+
+test("timezone offset + label", function()
+    eq(Timezone.formatOffset(-4 * 3600), "UTC−04:00")
+    eq(Timezone.formatOffset(8 * 3600), "UTC+08:00")
+    eq(Timezone.formatOffset(5.5 * 3600), "UTC+05:30")
+    eq(Timezone.label({ clock = { timezone_label = "Detroit time" } }), "Detroit time")
+    local expect = os.getenv("EXPECT_TZ_OFFSET")
+    if expect then
+        -- 1793223600 = 2026-10-28（夏令時間）；1798000000 = 2026-12-22（標準時間）
+        local got = Timezone.formatOffset(Timezone.utcOffsetSeconds(1793223600)) .. "/" ..
+            Timezone.formatOffset(Timezone.utcOffsetSeconds(1798000000))
+        eq(got, expect, "TZ=" .. tostring(os.getenv("TZ")))
+        print("  " .. tostring(os.getenv("TZ")) .. ": " .. Timezone.autoLabel(1793223600) .. " / " .. Timezone.autoLabel(1798000000))
+    end
+end)
+
 -- ── plugin flow ──
 local MacDeck = require("main")
 local function newPlugin()
