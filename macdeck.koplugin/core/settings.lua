@@ -21,8 +21,14 @@ M.DEFAULTS = {
     },
     idle = { controller_timeout_sec = 60 },
     transport = {
-        preferred = "mock",
+        preferred = "mock", -- "mock" = 假資料；"wifi" = 連 mac-companion
         connect_timeout_sec = 10,
+        wifi = {
+            host = "", -- Mac 的區網 IP，companion 啟動時會印出來
+            port = 8765,
+            token = "", -- mac-companion/token.txt 的內容
+            request_timeout_sec = 3, -- 每個指令最多卡住畫面幾秒
+        },
         mock_connect_delay_sec = 0.5,
         mock_fail_connect = false, -- 設為 true 可測 OFFLINE 畫面（T-05）
         mock_display_count = 2, -- 假螢幕數量（含內建），用來測多螢幕分頁
@@ -65,6 +71,11 @@ function M.validate(cfg)
     cfg.idle.controller_timeout_sec = clamp(cfg.idle.controller_timeout_sec, 10, 3600)
     cfg.transport.connect_timeout_sec = clamp(cfg.transport.connect_timeout_sec, 1, 60)
     cfg.ui.feedback_ms = clamp(cfg.ui.feedback_ms, 0, 1000)
+    if cfg.transport.preferred ~= "mock" and cfg.transport.preferred ~= "wifi" then
+        cfg.transport.preferred = "mock"
+    end
+    cfg.transport.wifi.port = clamp(math.floor(cfg.transport.wifi.port), 1, 65535)
+    cfg.transport.wifi.request_timeout_sec = clamp(cfg.transport.wifi.request_timeout_sec, 1, 10)
     cfg.transport.mock_display_count = clamp(math.floor(cfg.transport.mock_display_count), 0, 16)
     cfg.clock.full_refresh_min = clamp(cfg.clock.full_refresh_min, 0, 24 * 60)
     if cfg.ui.landscape_rotation ~= 1 and cfg.ui.landscape_rotation ~= 3 then

@@ -13,6 +13,7 @@ local Scheduler = require("core/scheduler")
 local Settings = require("core/settings")
 local StateMachine = require("core/state_machine")
 local Transport = require("transport/interface")
+local WifiTransport = require("transport/wifi")
 
 local Screen = Device.screen
 local S = StateMachine.STATES
@@ -52,12 +53,7 @@ function MacDeck:start()
     }
     self.session = s
 
-    s.transport = Transport.mock{
-        ui_manager = UIManager,
-        connect_delay_sec = cfg.transport.mock_connect_delay_sec,
-        fail_connect = cfg.transport.mock_fail_connect,
-        display_count = cfg.transport.mock_display_count,
-    }
+    s.transport = self:createTransport(cfg.transport)
     s.ticker = Scheduler.minuteTicker{ ui_manager = UIManager, on_tick = function() self:onMinute(s) end }
     s.idle = Scheduler.timeout(UIManager, cfg.idle.controller_timeout_sec, function() self:fire(s, "idle_timeout") end)
     s.connect_timeout = Scheduler.timeout(UIManager, cfg.transport.connect_timeout_sec, function()
@@ -77,6 +73,24 @@ function MacDeck:start()
         self:setRotation(cfg.ui.landscape_rotation)
     end
     s.machine:fire("open")
+end
+
+function MacDeck:createTransport(t)
+    if t.preferred == "wifi" then
+        return WifiTransport.new{
+            ui_manager = UIManager,
+            host = t.wifi.host,
+            port = t.wifi.port,
+            token = t.wifi.token,
+            timeout_sec = t.wifi.request_timeout_sec,
+        }
+    end
+    return Transport.mock{
+        ui_manager = UIManager,
+        connect_delay_sec = t.mock_connect_delay_sec,
+        fail_connect = t.mock_fail_connect,
+        display_count = t.mock_display_count,
+    }
 end
 
 -- 只接受目前 session 的事件，避免舊的 callback 打到新 session
@@ -224,6 +238,8 @@ function MacDeck:sendCommand(s, action, args, label, on_ok)
         if ack.status == "ok" then
             if label then screen:setResult(string.format("%s → OK (%s)", label, ack.id)) end
             if on_ok then on_ok(ack.data) end
+        elseif ack.offline then
+            self:fire(s, "disconnected", ack.detail) -- 連不到 Mac：進 OFFLINE，可 Retry
         else
             screen:setResult(string.format("%s → Error: %s", label or action, ack.detail or "unknown"))
         end

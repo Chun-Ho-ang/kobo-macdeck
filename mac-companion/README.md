@@ -4,11 +4,20 @@ Phase 1–3 走 Wi-Fi 本地 HTTP，只用 Python 標準庫。之後再加 `rump
 
 ```bash
 cp config.example.json config.json   # media_player: "Music" 或 "Spotify"
-python3 -m macdeck_companion --host 127.0.0.1 --port 8765
+python3 -m macdeck_companion --lan   # 讓 Kobo 從 Wi-Fi 連進來
 ```
 
-- 開發時預設只綁 `127.0.0.1`；要讓 Kobo 連進來，改用 Mac 的區網 IP（例如 `--host 192.168.1.20`），**不要開公網埠**。
-- 預設 `--dry-run`：只記錄不執行。確認白名單後再加 `--live`。
+- `--lan` 自動抓這台 Mac 的區網 IP，啟動時會印出 Kobo 要填的 `host` / `port`。只接受區網或 `127.0.0.1`，拒絕 `0.0.0.0` 和公網 IP。
+- **配對 token**：第一次啟動會產生 `token.txt`（權限 600），內容填到 Kobo 設定的 `token`。每個請求都要帶 `Authorization: Bearer <token>`，不對就回 401。不會寫進 log。換 token：刪掉 `token.txt` 再啟動。
+- 預設 dry-run：回假資料、不動 Mac。確認沒問題後再加 `--live`。
+- 第一次連線時 macOS 可能問「是否允許 Python 接受傳入連線」，要按允許。
+
+自己測（不經過 Kobo）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/command -H "Authorization: Bearer $(cat token.txt)" -d '{"protocol":"macdeck/1","id":"t1","type":"ping"}'
+```
+（用 `--lan` 啟動時，把 `127.0.0.1` 換成印出來的 IP。）
 
 ## 白名單動作
 

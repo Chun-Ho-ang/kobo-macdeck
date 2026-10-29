@@ -5,3 +5,4 @@ __pycache__/
 build/
 dist/
 mac-companion/config.json
+mac-companion/token.txt

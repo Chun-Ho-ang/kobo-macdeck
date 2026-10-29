@@ -75,12 +75,19 @@ def make_handler(actions: Actions, deduper: Deduper, token: str):
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
                 log.warning("rejected request from %s: bad token", self.client_address[0])
                 return self._reply(401, {"error": "bad token"})
-            length = int(self.headers.get("Content-Length", 0))
-            if length > MAX_BODY:
-                return self._reply(413, {"error": "too large"})
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                log.warning("rejected request from %s: chunked body (client must send Content-Length)", self.client_address[0])
+                return self._reply(411, {"error": "Content-Length required"})
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                return self._reply(413, {"error": "bad length"})
             try:
                 msg = parse_command(json.loads(self.rfile.read(length)))
             except (json.JSONDecodeError, ProtocolError) as e:
+                log.warning("rejected request from %s: %s", self.client_address[0], e)
                 return self._reply(400, {"error": str(e)})
 
             cached = deduper.get(msg["id"])

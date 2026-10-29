@@ -47,11 +47,23 @@ return {
         idle = { controller_timeout_sec = 30 },
         clock = { location_label = "Ann Arbor" }, -- Clock 顯示「Ann Arbor · EDT · UTC−04:00」
         -- clock = { timezone_label = "Detroit time" }, -- 自動時區不對時才需要手動填
-        transport = { mock_fail_connect = true }, -- 測 Offline 畫面
+        -- 連真的 Mac（Phase 2，見下方「Wi-Fi 連線」）：
+        -- transport = { preferred = "wifi", wifi = { host = "10.0.0.40", token = "<token.txt 的內容>" } },
+        -- transport = { mock_fail_connect = true }, -- 測 Offline 畫面
         -- transport = { mock_display_count = 6 }, -- 測多螢幕分頁
     },
 }
 ```
+
+### Wi-Fi 連線（Phase 2）
+
+1. Mac：`cd mac-companion && python3 -m macdeck_companion --lan`，記下印出的 host 和 `token.txt` 內容。
+2. Kobo：在上面的 `macdeck.lua` 填 `preferred = "wifi"`、`host`、`token`。
+3. Kobo 打開 Wi-Fi，和 Mac 連同一個網路。
+4. 打開 MacDeck → 點時鐘。連不上會進 Offline 畫面並顯示原因（沒開 Wi-Fi、token 錯、連線被拒…），按 Retry 重試。
+5. 使用中 Mac 斷線也會自動進 Offline。
+
+每個指令是同步 HTTP，最多卡住畫面 `wifi.request_timeout_sec`（預設 3 秒）。
 
 ### 實機待驗證（Phase 1 驗收）
 

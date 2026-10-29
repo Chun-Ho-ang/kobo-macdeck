@@ -280,5 +280,99 @@ test("30 open/close cycles (T-01)", function()
     eq(#U.stack, 0); eq(#U.tasks, 0); eq(Stubs.Screen.rotation, 0)
 end)
 
+-- ── Wi-Fi transport（假 HTTP：JSON 直接傳表，Mac 端行為借用 mock 的 handle） ──
+local Interface = require("transport/interface")
+local Wifi = require("transport/wifi")
+Wifi.json = { encode = function(t) return t end, decode = function(t) return t end }
+
+local function fakeMac(opts)
+    opts = opts or {}
+    local mac = Interface.mock{ ui_manager = U, display_count = 3 }
+    local fake = { requests = 0, down = false }
+    fake.post = function(url, headers, msg, timeout)
+        fake.requests = fake.requests + 1
+        fake.last_url, fake.last_timeout = url, timeout
+        fake.last_headers = headers
+        if fake.down then return nil, "connection refused" end
+        if headers.Authorization ~= "Bearer " .. (opts.token or "t0k") then return 401, "" end
+        if msg.type == "ping" then
+            return 200, { protocol = Interface.PROTOCOL, id = msg.id, type = "ack", status = "ok", detail = "pong" }
+        end
+        local status, detail, data = mac:handle(msg.action, msg.args)
+        return 200, { protocol = Interface.PROTOCOL, id = msg.id, type = "ack", status = status, detail = detail, data = data }
+    end
+    Wifi.httpPost = fake.post
+    return fake
+end
+
+local function wifiConfig(extra)
+    local w = { host = "192.168.1.20", token = "t0k" }
+    for k, v in pairs(extra or {}) do w[k] = v end
+    return { transport = { preferred = "wifi", wifi = w } }
+end
+
+test("wifi: connect, read state, send commands", function()
+    reset()
+    local fake = fakeMac()
+    Stubs.user_config = wifiConfig()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    eq(p.session.machine.state, "CONTROL")
+    eq(fake.last_url, "http://192.168.1.20:8765/command"); eq(fake.last_timeout, 3)
+    assert(tonumber(fake.last_headers["Content-Length"]), "Content-Length required (no chunked body)")
+    tapButton(U:top(), "Media control")
+    eq(p.session.media.level, 50, "volume.get over wifi")
+    tapButton(U:top(), "Vol +"); eq(p.session.media.level, 60)
+    tapButton(U:top(), "← Back"); tapButton(U:top(), "Monitor control")
+    eq(#p.session.displays, 3)
+    tapButton(U:top(), "Exit → KOReader")
+    eq(p.session, nil); eq(#U.tasks, 0)
+end)
+
+test("wifi: missing settings / bad token / Mac goes away → offline", function()
+    reset()
+    fakeMac()
+    Stubs.user_config = wifiConfig({ host = "" })
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    eq(p.session.machine.state, "OFFLINE"); eq(p.session.last_detail, "Set Mac host and token in macdeck.lua")
+    p:teardown(p.session)
+
+    reset()
+    fakeMac({ token = "other" })
+    Stubs.user_config = wifiConfig()
+    p:start(); U:top():onTapClock(); U:advance(1)
+    eq(p.session.machine.state, "OFFLINE"); eq(p.session.last_detail, "Mac rejected the token (check settings)")
+    p:teardown(p.session)
+
+    reset()
+    local fake = fakeMac()
+    Stubs.user_config = wifiConfig()
+    p:start(); U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Media control")
+    fake.down = true
+    tapButton(U:top(), "Play / Pause")
+    eq(p.session.machine.state, "OFFLINE", "lost Mac mid-session")
+    eq(p.session.last_detail, "connection refused")
+    fake.down = false
+    tapButton(U:top(), "Retry"); U:advance(1)
+    eq(p.session.machine.state, "CONTROL", "retry reconnects")
+    p:teardown(p.session)
+end)
+
+test("wifi: replies after disconnect are dropped", function()
+    reset()
+    local fake = fakeMac()
+    Stubs.user_config = wifiConfig()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    local t = p.session.transport
+    local got = 0
+    t:send("volume.get", {}, function() got = got + 1 end)
+    t:disconnect(); U:advance(1)
+    eq(got, 0); eq(fake.requests, 1, "only the ping went out")
+    p:teardown(p.session)
+end)
+
 print(string.format("%d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
