@@ -19,6 +19,7 @@ kobo-macdeck/
 2. **Phase 1** — UI MVP：Clock / Controller / Exit，先用假指令（`transport/interface.lua` 的 mock）
 3. **Phase 2** — 傳輸 Gate：先接 Wi-Fi（`transport/wifi.lua` ↔ `mac-companion`），BLE 待驗證
 4. **Phase 3+** — 白名單動作、配對、天氣 / 行事曆
+5. **Future** — 見 `docs/future-plan.md`（F-01：Touch Bar 風格的 App / 分頁切換器）
 
 ## Phase 1 現況（UI MVP，mock transport）
 
