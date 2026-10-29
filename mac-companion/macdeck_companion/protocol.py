@@ -1,6 +1,7 @@
 """Message envelope / ACK helpers (spec ch. 06)."""
 
 from collections import OrderedDict
+from typing import Optional
 
 from . import PROTOCOL
 
@@ -19,8 +20,11 @@ def parse_command(msg: dict) -> dict:
     return msg
 
 
-def ack(cmd_id: str, status: str, detail: str = "") -> dict:
-    return {"protocol": PROTOCOL, "id": cmd_id, "type": "ack", "status": status, "detail": detail}
+def ack(cmd_id: str, status: str, detail: str = "", data: Optional[dict] = None) -> dict:
+    reply = {"protocol": PROTOCOL, "id": cmd_id, "type": "ack", "status": status, "detail": detail}
+    if data is not None:
+        reply["data"] = data
+    return reply
 
 
 class Deduper:

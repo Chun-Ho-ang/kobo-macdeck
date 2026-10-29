@@ -43,6 +43,12 @@ function MacDeck:start()
         cfg = cfg,
         saved = { rotation = Screen:getRotationMode() },
         minutes = 0,
+        page = "home",
+        media = nil,
+        displays = nil,
+        display_index = 1,
+        display_id = nil, -- 以 id 記住選的螢幕，插拔後清單順序變了也不會選錯
+        display_page = 1,
     }
     self.session = s
 
@@ -50,6 +56,7 @@ function MacDeck:start()
         ui_manager = UIManager,
         connect_delay_sec = cfg.transport.mock_connect_delay_sec,
         fail_connect = cfg.transport.mock_fail_connect,
+        display_count = cfg.transport.mock_display_count,
     }
     s.ticker = Scheduler.minuteTicker{ ui_manager = UIManager, on_tick = function() self:onMinute(s) end }
     s.idle = Scheduler.timeout(UIManager, cfg.idle.controller_timeout_sec, function() self:fire(s, "idle_timeout") end)
@@ -105,6 +112,7 @@ function MacDeck:enter(s, state)
             end
         end)
     elseif state == S.CONTROL or state == S.OFFLINE then
+        s.page = "home" -- 每次連上都從 Controller 首頁開始
         self:showScreen(s, self:controller(s, state))
         s.idle:reset()
     end
@@ -126,25 +134,98 @@ end
 function MacDeck:controller(s, mode)
     return ControllerScreen:new(self:screenCallbacks(s, {
         mode = mode,
+        page = s.page,
+        media = s.media,
+        displays = s.displays,
+        display_index = s.display_index,
+        display_page = s.display_page,
         message = mode == "OFFLINE" and s.last_detail or nil,
         on_activity = function()
             if s.machine.state == S.CONTROL or s.machine.state == S.OFFLINE then s.idle:reset() end
         end,
         on_retry = function() self:fire(s, "retry") end,
-        on_command = function(spec) self:sendCommand(s, spec) end,
+        on_page = function(page) self:openPage(s, page) end,
+        on_command = function(action, args, label) self:sendCommand(s, action, args, label, function(data)
+            if data and data.level ~= nil then self:applyVolume(s, data) end
+        end) end,
+        on_volume = function(level) self:setVolume(s, level) end,
+        on_select_display = function(i)
+            local d = s.displays and s.displays[i]
+            if not d then return end
+            s.display_index, s.display_id = i, d.id
+            self:showScreen(s, self:controller(s, S.CONTROL))
+        end,
+        on_list_page = function(delta)
+            s.display_page = s.display_page + delta
+            self:showScreen(s, self:controller(s, S.CONTROL))
+        end,
+        on_refresh = function() self:openPage(s, "monitor") end,
+        on_brightness = function(level) self:setBrightness(s, level) end,
     }))
 end
 
-function MacDeck:sendCommand(s, spec)
+-- Controller 內換頁（仍在 CONTROL 狀態）；進頁時向 Mac 讀目前狀態
+function MacDeck:openPage(s, page)
+    if self.session ~= s or s.machine.state ~= S.CONTROL then return end
+    s.page = page
+    if page == "monitor" then s.displays = nil end
+    self:showScreen(s, self:controller(s, S.CONTROL))
+    if page == "media" then
+        self:sendCommand(s, "volume.get", {}, nil, function(data) self:applyVolume(s, data) end)
+    elseif page == "monitor" then
+        self:sendCommand(s, "display.list", {}, nil, function(data)
+            if s.page ~= "monitor" then return end
+            self:applyDisplays(s, data and data.displays or {})
+            self:showScreen(s, self:controller(s, S.CONTROL))
+        end)
+    end
+end
+
+-- 螢幕數量由 Mac 回報、不固定；保留原本選的那台（找不到就選第一台）
+function MacDeck:applyDisplays(s, displays)
+    s.displays = displays
+    s.display_index = 1
+    for i, d in ipairs(displays) do
+        if d.id == s.display_id then s.display_index = i end
+    end
+    s.display_id = displays[s.display_index] and displays[s.display_index].id or nil
+    s.display_page = math.floor((s.display_index - 1) / ControllerScreen.DISPLAYS_PER_PAGE) + 1
+end
+
+function MacDeck:applyVolume(s, data)
+    if type(data) ~= "table" then return end
+    s.media = { level = data.level, muted = data.muted }
+    if s.page == "media" and s.screen then s.screen:setVolume(data.level, data.muted) end
+end
+
+function MacDeck:setVolume(s, level)
+    -- 先在畫面上更新（E-Ink 回饋要快），再以 Mac 回傳值為準
+    if s.screen then s.screen:setVolume(level, false) end
+    self:sendCommand(s, "volume.set", { level = level }, string.format("Volume %d%%", level), function(data)
+        self:applyVolume(s, data)
+    end)
+end
+
+function MacDeck:setBrightness(s, level)
+    local d = s.displays and s.displays[s.display_index]
+    if not d then return end
+    if s.screen then s.screen:setBrightness(level) end
+    self:sendCommand(s, "display.brightness.set", { display_id = d.id, level = level },
+        string.format("%s %d%%", d.name, level))
+end
+
+--- label = nil 時不顯示在狀態列（背景讀取用）；on_ok(data) 只在 ACK ok 時呼叫
+function MacDeck:sendCommand(s, action, args, label, on_ok)
     if self.session ~= s or s.machine.state ~= S.CONTROL then return end
     local screen = s.screen
-    screen:setResult(spec.label .. " …")
-    s.transport:send(spec.action, spec.args, function(ack)
+    if label then screen:setResult(label .. " …") end
+    s.transport:send(action, args, function(ack)
         if self.session ~= s or s.screen ~= screen then return end
         if ack.status == "ok" then
-            screen:setResult(string.format("%s → OK (%s)", spec.label, ack.id))
+            if label then screen:setResult(string.format("%s → OK (%s)", label, ack.id)) end
+            if on_ok then on_ok(ack.data) end
         else
-            screen:setResult(string.format("%s → Error: %s", spec.label, ack.detail or "unknown"))
+            screen:setResult(string.format("%s → Error: %s", label or action, ack.detail or "unknown"))
         end
     end)
 end

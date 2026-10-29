@@ -25,17 +25,7 @@ M.DEFAULTS = {
         connect_timeout_sec = 10,
         mock_connect_delay_sec = 0.5,
         mock_fail_connect = false, -- 設為 true 可測 OFFLINE 畫面（T-05）
-    },
-    buttons = {
-        { label = "Terminal", action = "app.activate", args = { app_id = "terminal" } },
-        { label = "VS Code", action = "app.activate", args = { app_id = "vscode" } },
-        { label = "Screenshot", action = "workflow.run", args = { workflow_id = "screenshot" } },
-        { label = "Mute", action = "audio.mute" },
-        { label = "Play / Pause", action = "media.toggle" },
-        { label = "Focus", action = "workflow.run", args = { workflow_id = "focus" } },
-        { label = "Lock Mac", action = "mac.lock" },
-        { label = "Shortcut", action = "workflow.run", args = { workflow_id = "shortcut" } },
-        { label = "More…" }, -- 沒有 action = 停用
+        mock_display_count = 2, -- 假螢幕數量（含內建），用來測多螢幕分頁
     },
 }
 
@@ -50,7 +40,7 @@ local function copy(v)
     return out
 end
 
--- 深層合併；陣列（例如 buttons）整個取代，型別不符的欄位忽略
+-- 深層合併；陣列整個取代，型別不符的欄位忽略
 function M.merge(defaults, user)
     local out = copy(defaults)
     if type(user) ~= "table" then return out end
@@ -75,17 +65,11 @@ function M.validate(cfg)
     cfg.idle.controller_timeout_sec = clamp(cfg.idle.controller_timeout_sec, 10, 3600)
     cfg.transport.connect_timeout_sec = clamp(cfg.transport.connect_timeout_sec, 1, 60)
     cfg.ui.feedback_ms = clamp(cfg.ui.feedback_ms, 0, 1000)
+    cfg.transport.mock_display_count = clamp(math.floor(cfg.transport.mock_display_count), 0, 16)
     cfg.clock.full_refresh_min = clamp(cfg.clock.full_refresh_min, 0, 24 * 60)
     if cfg.ui.landscape_rotation ~= 1 and cfg.ui.landscape_rotation ~= 3 then
         cfg.ui.landscape_rotation = 1
     end
-    local buttons = {}
-    for _, b in ipairs(cfg.buttons) do
-        if type(b) == "table" and type(b.label) == "string" and #buttons < 9 then
-            table.insert(buttons, b)
-        end
-    end
-    cfg.buttons = buttons
     return cfg
 end
 

@@ -1,10 +1,4 @@
 {
   "schema": 1,
-  "apps": {
-    "terminal": "Terminal",
-    "vscode": "Visual Studio Code"
-  },
-  "workflows": {
-    "screenshot": "MacDeck Screenshot"
-  }
+  "media_player": "Music"
 }

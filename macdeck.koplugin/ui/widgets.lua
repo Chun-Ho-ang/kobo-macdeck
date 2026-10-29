@@ -15,6 +15,7 @@ local RightContainer = require("ui/widget/container/rightcontainer")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Screen = Device.screen
 
@@ -104,6 +105,7 @@ W.BigButton = InputContainer:extend{
     height = nil,
     font_size = 20,
     callback = nil, -- nil = 停用
+    selected = false, -- 選取中：黑底白字（例如目前選的螢幕）
     feedback_ms = 250,
     show_parent = nil,
 }
@@ -114,12 +116,15 @@ function W.BigButton:init()
     local label = W.text(self.text, self.font_size, self.callback ~= nil, self.width - 2 * m.pad)
     if not self.callback then
         label.fgcolor = Blitbuffer.COLOR_DARK_GRAY
+    elseif self.selected then
+        label.fgcolor = Blitbuffer.COLOR_WHITE
     end
+    self.label = label
     self.frame = FrameContainer:new{
         bordersize = m.border,
         padding = 0,
         margin = 0,
-        background = Blitbuffer.COLOR_WHITE,
+        background = self.selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
         CenterContainer:new{
             dimen = Geom:new{ w = self.width - 2 * m.border, h = self.height - 2 * m.border },
             label,
@@ -148,11 +153,91 @@ function W.BigButton:onTapBigButton()
     return true
 end
 
+function W.BigButton:setText(text)
+    self.text = text
+    self.label:setText(text)
+    UIManager:setDirty(self.show_parent, "ui", self.dimen)
+end
+
 function W.BigButton:onCloseWidget()
     if self._pending then
         UIManager:unschedule(self._pending)
         self._pending = nil
     end
+end
+
+-- 分段滑軌：E-Ink 不適合拖曳，改成點哪一格就設到哪一格（1..segments）
+-- vertical = true 時第 1 格在最下面
+W.SegmentBar = InputContainer:extend{
+    width = nil,
+    height = nil,
+    segments = 10,
+    value = 0,
+    vertical = false,
+    on_change = nil, -- function(index)
+    show_parent = nil,
+}
+
+function W.SegmentBar:init()
+    local m = W.metrics()
+    local n = self.segments
+    local sgap = math.max(2, math.floor(m.gap / 3))
+    local along = self.vertical and self.height or self.width
+    local seg = math.floor((along - (n - 1) * sgap) / n)
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+    self.frames = {}
+    local group = self.vertical and VerticalGroup:new{} or HorizontalGroup:new{}
+    local Span = self.vertical and VerticalSpan or HorizontalSpan
+    for k = 1, n do
+        local i = self.vertical and (n - k + 1) or k
+        local size = self.vertical and Geom:new{ w = self.width - 2 * m.border, h = seg - 2 * m.border }
+            or Geom:new{ w = seg - 2 * m.border, h = self.height - 2 * m.border }
+        local frame = FrameContainer:new{
+            bordersize = m.border,
+            padding = 0,
+            margin = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            WidgetContainer:new{ dimen = size },
+        }
+        self.frames[i] = frame
+        if k > 1 then table.insert(group, Span:new{ width = sgap }) end
+        table.insert(group, frame)
+    end
+    self[1] = group
+    self:paintValue()
+    self.ges_events = {
+        TapSegmentBar = { GestureRange:new{ ges = "tap", range = function() return self.dimen end } },
+    }
+end
+
+function W.SegmentBar:paintValue()
+    for i, frame in ipairs(self.frames) do
+        frame.background = (i <= self.value) and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+    end
+end
+
+function W.SegmentBar:indexAt(pos)
+    local n = self.segments
+    local idx
+    if self.vertical then
+        idx = n - math.floor((pos.y - self.dimen.y) * n / self.dimen.h)
+    else
+        idx = math.floor((pos.x - self.dimen.x) * n / self.dimen.w) + 1
+    end
+    return math.max(1, math.min(n, idx))
+end
+
+function W.SegmentBar:onTapSegmentBar(_, ges)
+    local idx = self:indexAt(ges.pos)
+    self:setValue(idx)
+    if self.on_change then self.on_change(idx) end
+    return true
+end
+
+function W.SegmentBar:setValue(v)
+    self.value = math.max(0, math.min(self.segments, v))
+    self:paintValue()
+    UIManager:setDirty(self.show_parent, "ui", self.dimen)
 end
 
 -- 全螢幕畫面底座：白底、覆蓋整個畫面，並轉發 Close / Suspend / Resume 給擁有者
@@ -199,8 +284,9 @@ function W.buttonRow(specs, width, height, show_parent, feedback_ms)
             text = s.text,
             width = (i == n) and (width - (n - 1) * (w + m.gap)) or w,
             height = height,
-            font_size = 18,
+            font_size = s.font_size or 18,
             callback = s.callback,
+            selected = s.selected,
             show_parent = show_parent,
             feedback_ms = feedback_ms,
         })

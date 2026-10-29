@@ -24,7 +24,10 @@ kobo-macdeck/
 
 - KOReader 主選單 → 工具 → **MacDeck** 啟動
 - 啟動後轉橫向、顯示 Clock；每分鐘對齊整分刷新時間區塊，每 30 分鐘全刷一次
-- 點 Clock 任一處 → Connecting（mock 0.5 秒）→ Controller 3×3 按鈕；點按鈕會反白並顯示 mock ACK
+- 點 Clock 任一處 → Connecting（mock 0.5 秒）→ Controller 首頁：**Media control** / **Monitor control**
+  - Media：上一首 / 播放暫停 / 下一首；音量條（點哪格設到哪，10 格 = 10%）+ 小聲 / 大聲 / 靜音
+  - Monitor：左邊選螢幕，右邊亮度條 + 亮 / 暗。螢幕數量由 Mac 回報、不固定：超過 4 台自動分頁（‹ / ›），插拔螢幕後按 Refresh 重新讀取，原本選的那台會保留（以 id 辨識）
+  - 點按鈕會反白並在底部顯示 ACK；子頁底列有 ← Back / ← Clock / Exit
 - Controller 60 秒沒觸控 → 回 Clock；Clock / Controller / Connecting / Offline 都有 Exit
 - Exit、畫面被系統關閉、或內部出錯時，都會清掉計時器並還原螢幕方向
 - 系統休眠喚醒後回到 Clock 並重新對齊時間
@@ -44,6 +47,7 @@ return {
         clock = { location_label = "Ann Arbor" }, -- Clock 顯示「Ann Arbor · EDT · UTC−04:00」
         -- clock = { timezone_label = "Detroit time" }, -- 自動時區不對時才需要手動填
         transport = { mock_fail_connect = true }, -- 測 Offline 畫面
+        -- transport = { mock_display_count = 6 }, -- 測多螢幕分頁
     },
 }
 ```
@@ -61,7 +65,8 @@ return {
 
 ```bash
 pip install lupa
-python3 tests/run_lua_tests.py
+python3 tests/run_lua_tests.py          # Kobo 插件
+python3 -m unittest discover -s tests   # Mac Companion
 ```
 
 測試用 `tests/koreader_stubs.lua` 模擬 UIManager、計時器與螢幕旋轉，只驗證狀態流程與清理，**不驗證畫面排版**，排版要在實機上看。

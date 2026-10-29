@@ -83,13 +83,13 @@ end)
 test("settings merge + validate", function()
     local cfg = Settings.validate(Settings.merge(Settings.DEFAULTS, {
         idle = { controller_timeout_sec = 1 }, ui = { orientation = 5 }, unknown = 1,
-        buttons = { { label = "A", action = "audio.mute" } },
     }))
     eq(cfg.idle.controller_timeout_sec, 10, "clamped")
     eq(cfg.ui.orientation, "landscape", "type mismatch ignored")
-    eq(#cfg.buttons, 1, "array replaced")
     eq(cfg.unknown, nil)
-    eq(#Settings.DEFAULTS.buttons, 9, "defaults untouched")
+    eq(Settings.DEFAULTS.idle.controller_timeout_sec, 60, "defaults untouched")
+    local merged = Settings.merge({ list = { 1, 2, 3 } }, { list = { 9 } })
+    eq(#merged.list, 1, "array replaced")
 end)
 
 local Timezone = require("core/timezone")
@@ -135,10 +135,15 @@ test("full flow: clock → control → command → idle → exit", function()
     U:advance(1)
     eq(p.session.machine.state, "CONTROL"); eq(#U.stack, 1, "old screen closed")
 
-    tapButton(U:top(), "Mute")
+    tapButton(U:top(), "Media control")
+    U:advance(1)
+    eq(U:top().page, "media"); eq(U:top().volume_bar.value, 5, "volume.get → 50%")
+    tapButton(U:top(), "Play / Pause")
     assert(U:top().result_text.text:find("OK"), "ack shown: " .. U:top().result_text.text)
-    eq(p.session.machine.state, "CONTROL", "after mute"); tapButton(U:top(), "More…")
-    eq(p.session.machine.state, "CONTROL", "disabled button ignored")
+    tapButton(U:top(), "Mute"); eq(U:top().volume_bar.value, 0, "muted")
+    tapButton(U:top(), "Vol +"); eq(U:top().volume_bar.value, 6, "50 → 60, unmuted")
+    eq(p.session.transport.state.volume, 60)
+    tapButton(U:top(), "← Back"); eq(U:top().page, "home")
 
     U:advance(50); eq(p.session.machine.state, "CONTROL")
     U:top():onTapController(); U:advance(59); eq(p.session.machine.state, "CONTROL", "activity resets idle")
@@ -148,6 +153,70 @@ test("full flow: clock → control → command → idle → exit", function()
     eq(p.session, nil); eq(#U.stack, 0); eq(Stubs.Screen.rotation, 0, "rotation restored")
     eq(#U.tasks, 0, "no timers left")
     eq(Stubs.errors, 0)
+end)
+
+test("media volume bar + monitor brightness", function()
+    reset()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Media control"); U:advance(1)
+    local bar = U:top().volume_bar
+    bar.dimen = { x = 100, y = 0, w = 1000, h = 50 }
+    bar:onTapSegmentBar(nil, { pos = { x = 100 + 820, y = 10 } }); U:advance(1)
+    eq(p.session.transport.state.volume, 90, "9th segment = 90%")
+    eq(U:top().volume_bar.value, 9)
+
+    tapButton(U:top(), "← Back"); tapButton(U:top(), "Monitor control")
+    U:advance(1)
+    local scr = U:top()
+    eq(#scr.display_buttons, 2, "two mock displays"); eq(scr.brightness_bar.value, 7, "builtin 70%")
+    tapButton(scr, "External display 1 · 50%")
+    scr = U:top(); eq(scr.display_index, 2); eq(scr.brightness_bar.value, 5)
+    tapButton(scr, "Brighter")
+    eq(p.session.transport.state.displays[2].brightness, 60)
+    local vb = scr.brightness_bar
+    vb.dimen = { x = 0, y = 0, w = 50, h = 1000 }
+    vb:onTapSegmentBar(nil, { pos = { x = 10, y = 950 } }); U:advance(1)
+    eq(p.session.transport.state.displays[2].brightness, 10, "bottom segment = 10%")
+    eq(scr.display_buttons[2].text, "External display 1 · 10%")
+    tapButton(scr, "Exit → KOReader"); eq(#U.tasks, 0); eq(#U.stack, 0)
+end)
+
+test("variable display count: paging, refresh, hot-plug", function()
+    reset()
+    Stubs.user_config = { transport = { mock_display_count = 6 } }
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Monitor control"); U:advance(1)
+    local scr = U:top()
+    eq(#p.session.displays, 6)
+    assert(scr.display_buttons[4] and not scr.display_buttons[5], "page 1 shows 1-4")
+    tapButton(scr, "›"); scr = U:top()
+    assert(scr.display_buttons[5] and scr.display_buttons[6], "page 2 shows 5-6")
+    tapButton(scr, "External display 5 · 50%"); scr = U:top()
+    eq(p.session.display_id, "5"); eq(scr.display_page, 2)
+
+    -- 拔掉兩台外接螢幕（1、2），選的那台還在，只是位置變了
+    local st = p.session.transport.state
+    table.remove(st.displays, 2); table.remove(st.displays, 2)
+    tapButton(scr, "Refresh"); U:advance(1); scr = U:top()
+    eq(#p.session.displays, 4); eq(p.session.display_id, "5"); eq(scr.display_index, 4)
+    eq(scr.display_page, 1, "fits on one page now")
+    assert(not scr.display_buttons[5], "no paging needed")
+
+    -- 選的那台也拔掉 → 退回第一台
+    table.remove(st.displays, 4)
+    tapButton(scr, "Refresh"); U:advance(1)
+    eq(p.session.display_id, "builtin"); eq(U:top().display_index, 1)
+
+    -- 全部拔掉（理論上至少有內建，但 Mac 蓋上時可能是 0）
+    st.displays = {}
+    tapButton(U:top(), "Refresh"); U:advance(1)
+    eq(#p.session.displays, 0); eq(p.session.display_id, nil)
+    st.displays = { { id = "builtin", name = "Built-in display", brightness = 40 } }
+    tapButton(U:top(), "Refresh"); U:advance(1)
+    eq(#p.session.displays, 1, "refresh works from the empty state")
+    tapButton(U:top(), "Exit → KOReader"); eq(#U.tasks, 0)
 end)
 
 test("exit while connecting + offline path", function()

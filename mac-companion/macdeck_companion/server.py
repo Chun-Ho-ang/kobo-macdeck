@@ -50,8 +50,9 @@ def make_handler(actions: Actions, deduper: Deduper):
                 reply = ack(msg["id"], "ok", "pong")
             else:
                 try:
-                    detail = actions.execute(msg.get("action", ""), msg.get("args", {}))
-                    reply = ack(msg["id"], "ok", detail)
+                    args = msg.get("args", {})
+                    detail, data = actions.execute(msg.get("action", ""), args if isinstance(args, dict) else {})
+                    reply = ack(msg["id"], "ok", detail, data)
                 except ActionError as e:
                     reply = ack(msg["id"], "error", str(e))
             deduper.put(msg["id"], reply)
