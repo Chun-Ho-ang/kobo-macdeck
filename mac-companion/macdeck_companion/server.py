@@ -9,15 +9,19 @@ import os
 import secrets
 import socket
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .actions import ActionError, Actions
+from .agents import AgentHub
 from .protocol import Deduper, ProtocolError, ack, parse_command
 
 log = logging.getLogger("macdeck")
 
 MAX_BODY = 4096
+MAX_HOOK_BODY = 4 * 1024 * 1024  # hook 會帶整個 tool_input（例如 Write 的檔案內容）
+QUIET_ACTIONS = ("agents.list",)  # Kobo 每幾秒輪詢一次，不寫 log
 
 
 def load_config(path: Path) -> dict:
@@ -39,6 +43,15 @@ def load_token(path: Path) -> str:
     return token
 
 
+def write_hook_auth(token: str, token_path: Path) -> Path:
+    """Header file for the Claude Code hook script (curl -H @file), so the token never shows up in `ps`."""
+    path = token_path.resolve().with_name("hook-auth.txt")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"Authorization: Bearer {token}\n")
+    return path
+
+
 def lan_address() -> str:
     """The IPv4 address other devices on this network reach the Mac at (no packet is sent)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -56,9 +69,9 @@ def check_host(host: str) -> None:
         raise SystemExit(f"refusing to listen on {host}: use 127.0.0.1 or this Mac's local network address (--lan)")
 
 
-def make_handler(actions: Actions, deduper: Deduper, token: str):
+def make_handler(actions: Actions, deduper: Deduper, token: str, hub: AgentHub = None, hooks: bool = False):
+    """hooks = True only on the 127.0.0.1 listener: Claude Code status never comes from the network."""
     expected = f"Bearer {token}".encode()
-
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code: int, body: dict):
@@ -69,9 +82,8 @@ def make_handler(actions: Actions, deduper: Deduper, token: str):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_POST(self):
-            if self.path != "/command":
-                return self._reply(404, {"error": "not found"})
+        def _body(self, limit: int):
+            """Raw body, or None after replying with an error."""
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
                 log.warning("rejected request from %s: bad token", self.client_address[0])
                 return self._reply(401, {"error": "bad token"})
@@ -82,10 +94,20 @@ def make_handler(actions: Actions, deduper: Deduper, token: str):
                 length = int(self.headers.get("Content-Length", 0))
             except ValueError:
                 length = -1
-            if length < 0 or length > MAX_BODY:
+            if length < 0 or length > limit:
                 return self._reply(413, {"error": "bad length"})
+            return self.rfile.read(length)
+
+        def do_POST(self):
+            if self.path == "/hook" and hooks and hub is not None:
+                return self._hook()
+            if self.path != "/command":
+                return self._reply(404, {"error": "not found"})
+            body = self._body(MAX_BODY)
+            if body is None:
+                return
             try:
-                msg = parse_command(json.loads(self.rfile.read(length)))
+                msg = parse_command(json.loads(body))
             except (json.JSONDecodeError, ProtocolError) as e:
                 log.warning("rejected request from %s: %s", self.client_address[0], e)
                 return self._reply(400, {"error": str(e)})
@@ -104,8 +126,23 @@ def make_handler(actions: Actions, deduper: Deduper, token: str):
                 except ActionError as e:
                     reply = ack(msg["id"], "error", str(e))
             deduper.put(msg["id"], reply)
-            log.info("%s %s -> %s", msg["id"], msg.get("action", "ping"), reply["status"])
+            if msg.get("action") not in QUIET_ACTIONS or reply["status"] != "ok":
+                log.info("%s %s -> %s", msg["id"], msg.get("action", "ping"), reply["status"])
             self._reply(200, reply)
+
+        def _hook(self):
+            body = self._body(MAX_HOOK_BODY)
+            if body is None:
+                return
+            try:
+                event = json.loads(body)
+            except json.JSONDecodeError:
+                return self._reply(400, {"error": "bad json"})
+            if isinstance(event, dict):
+                # 只記事件名稱，不記 prompt / 指令內容
+                log.debug("hook %s", event.get("hook_event_name"))
+                hub.handle(event, self.headers.get("X-MacDeck-App", ""), self.headers.get("X-MacDeck-Term", ""))
+            self._reply(200, {})
 
         def log_message(self, fmt, *args):
             pass
@@ -127,10 +164,19 @@ def main():
     check_host(host)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
     token = load_token(a.token_file)
-    actions = Actions(load_config(a.config), dry_run=not a.live)
-    server = ThreadingHTTPServer((host, a.port), make_handler(actions, Deduper(), token))
+    write_hook_auth(token, a.token_file)
+    hub = AgentHub()
+    actions = Actions(load_config(a.config), dry_run=not a.live, hub=hub)
+    deduper = Deduper()
+    loopback = ipaddress.ip_address(host).is_loopback
+    server = ThreadingHTTPServer((host, a.port), make_handler(actions, deduper, token, hub, hooks=loopback))
+    if not loopback:
+        # Claude Code hooks 一律打 127.0.0.1；另開一個只收本機的 listener
+        local = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(actions, deduper, token, hub, hooks=True))
+        threading.Thread(target=local.serve_forever, daemon=True).start()
     log.info("listening on %s:%d (%s)", host, a.port, "live" if a.live else "dry-run")
     log.info("Kobo settings: host = \"%s\", port = %d, token = contents of %s", host, a.port, a.token_file.resolve())
+    log.info("Claude Code hooks: http://127.0.0.1:%d/hook", a.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

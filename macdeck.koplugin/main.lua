@@ -13,6 +13,7 @@ local Scheduler = require("core/scheduler")
 local Settings = require("core/settings")
 local StateMachine = require("core/state_machine")
 local Transport = require("transport/interface")
+local W = require("ui/widgets")
 local WifiTransport = require("transport/wifi")
 
 local Screen = Device.screen
@@ -46,16 +47,24 @@ function MacDeck:start()
         minutes = 0,
         page = "home",
         media = nil,
-        displays = nil,
-        display_index = 1,
-        display_id = nil, -- 以 id 記住選的螢幕，插拔後清單順序變了也不會選錯
-        display_page = 1,
+        info = nil, -- 時鐘右側的天氣 / 行程（Mac 同步來的）
+        last_sync = nil, -- 上次嘗試同步的時間（Scheduler.now）
+        syncing = false,
+        agents = nil,
+        agent_index = 1,
+        agent_id = nil, -- 以 id 記住選的 session，清單重新排序也不會選錯
+        agent_page = 1,
     }
     self.session = s
 
     s.transport = self:createTransport(cfg.transport)
     s.ticker = Scheduler.minuteTicker{ ui_manager = UIManager, on_tick = function() self:onMinute(s) end }
-    s.idle = Scheduler.timeout(UIManager, cfg.idle.controller_timeout_sec, function() self:fire(s, "idle_timeout") end)
+    s.idle = Scheduler.timeout(UIManager, cfg.idle.controller_timeout_sec, function()
+        if s.page == "agents" and cfg.agents.stay_open and s.machine.state == S.CONTROL then
+            return s.idle:reset() -- Agents 頁當狀態板用，不跳回時鐘
+        end
+        self:fire(s, "idle_timeout")
+    end)
     s.connect_timeout = Scheduler.timeout(UIManager, cfg.transport.connect_timeout_sec, function()
         self:fire(s, "failed", "Connection timed out")
     end)
@@ -89,7 +98,7 @@ function MacDeck:createTransport(t)
         ui_manager = UIManager,
         connect_delay_sec = t.mock_connect_delay_sec,
         fail_connect = t.mock_fail_connect,
-        display_count = t.mock_display_count,
+        agent_count = t.mock_agent_count,
     }
 end
 
@@ -101,6 +110,8 @@ function MacDeck:fire(s, event, detail)
 end
 
 function MacDeck:enter(s, state)
+    self:stopPolling(s)
+    s.syncing = false -- 同步做到一半被換狀態：那次結果會被 transport 丟掉
     s.idle:cancel()
     s.connect_timeout:cancel()
     s.ticker:stop()
@@ -109,11 +120,13 @@ function MacDeck:enter(s, state)
         self:teardown(s)
     elseif state == S.CLOCK then
         s.transport:disconnect() -- 回到時鐘就降載控制傳輸
-        self:showScreen(s, ClockScreen:new(self:screenCallbacks(s, {
-            on_control = function() self:fire(s, "control") end,
-        })))
+        self:showClock(s)
         s.minutes = 0
         s.ticker:start()
+        if self:syncDue(s) then
+            s.sync_tick = function() s.sync_tick = nil; self:syncInfo(s) end
+            UIManager:nextTick(s.sync_tick)
+        end
     elseif state == S.CONNECTING then
         self:showScreen(s, self:controller(s, "CONNECTING"))
         s.connect_timeout:reset()
@@ -130,6 +143,53 @@ function MacDeck:enter(s, state)
         self:showScreen(s, self:controller(s, state))
         s.idle:reset()
     end
+end
+
+function MacDeck:showClock(s)
+    self:showScreen(s, ClockScreen:new(self:screenCallbacks(s, {
+        info = s.info,
+        on_control = function() self:fire(s, "control") end,
+    })))
+end
+
+-- ── Clock info sync ──────────────────────────────────────
+-- 時鐘畫面平常不連線；每 clock.sync_min 分鐘短暫連一次 Mac 拿天氣 / 下一個行程，拿完就斷
+
+function MacDeck:syncDue(s)
+    local every = s.cfg.clock.sync_min
+    if every <= 0 or s.syncing then return false end
+    return s.last_sync == nil or Scheduler.now() - s.last_sync >= every * 60
+end
+
+function MacDeck:syncInfo(s)
+    if self.session ~= s or s.machine.state ~= S.CLOCK or not self:syncDue(s) then return end
+    s.syncing, s.last_sync = true, Scheduler.now()
+    local function finish(info)
+        if self.session ~= s or s.machine.state ~= S.CLOCK or not s.syncing then return end
+        s.syncing = false
+        s.transport:disconnect()
+        s.info = info
+        self:showClock(s)
+    end
+    s.transport:connect(function(ok, err)
+        if not ok then
+            -- 保留上次的資料，只在底部說明這次為什麼沒同步到
+            local info = {}
+            for k, v in pairs(s.info or {}) do info[k] = v end
+            info.error = err or "not synced"
+            return finish(info)
+        end
+        s.transport:send("info.get", {}, function(ack)
+            if ack.status == "ok" and type(ack.data) == "table" then
+                finish(ack.data)
+            else
+                local info = {}
+                for k, v in pairs(s.info or {}) do info[k] = v end
+                info.error = ack.detail or "sync failed"
+                finish(info)
+            end
+        end)
+    end)
 end
 
 function MacDeck:screenCallbacks(s, extra)
@@ -150,9 +210,9 @@ function MacDeck:controller(s, mode)
         mode = mode,
         page = s.page,
         media = s.media,
-        displays = s.displays,
-        display_index = s.display_index,
-        display_page = s.display_page,
+        agents = s.agents,
+        agent_index = s.agent_index,
+        agent_page = s.agent_page,
         message = mode == "OFFLINE" and s.last_detail or nil,
         on_activity = function()
             if s.machine.state == S.CONTROL or s.machine.state == S.OFFLINE then s.idle:reset() end
@@ -163,47 +223,113 @@ function MacDeck:controller(s, mode)
             if data and data.level ~= nil then self:applyVolume(s, data) end
         end) end,
         on_volume = function(level) self:setVolume(s, level) end,
-        on_select_display = function(i)
-            local d = s.displays and s.displays[i]
-            if not d then return end
-            s.display_index, s.display_id = i, d.id
+        on_select_agent = function(i)
+            local a = s.agents and s.agents[i]
+            if not a then return end
+            s.agent_index, s.agent_id = i, a.id
             self:showScreen(s, self:controller(s, S.CONTROL))
         end,
         on_list_page = function(delta)
-            s.display_page = s.display_page + delta
+            s.agent_page = s.agent_page + delta
             self:showScreen(s, self:controller(s, S.CONTROL))
         end,
-        on_refresh = function() self:openPage(s, "monitor") end,
-        on_brightness = function(level) self:setBrightness(s, level) end,
+        on_agent_key = function(key) self:agentKey(s, key) end,
     }))
 end
 
 -- Controller 內換頁（仍在 CONTROL 狀態）；進頁時向 Mac 讀目前狀態
 function MacDeck:openPage(s, page)
     if self.session ~= s or s.machine.state ~= S.CONTROL then return end
+    self:stopPolling(s)
     s.page = page
-    if page == "monitor" then s.displays = nil end
     self:showScreen(s, self:controller(s, S.CONTROL))
     if page == "media" then
         self:sendCommand(s, "volume.get", {}, nil, function(data) self:applyVolume(s, data) end)
-    elseif page == "monitor" then
-        self:sendCommand(s, "display.list", {}, nil, function(data)
-            if s.page ~= "monitor" then return end
-            self:applyDisplays(s, data and data.displays or {})
-            self:showScreen(s, self:controller(s, S.CONTROL))
-        end)
+    elseif page == "agents" then
+        self:pollAgents(s)
     end
 end
 
--- 螢幕數量由 Mac 回報、不固定；保留原本選的那台（找不到就選第一台）
-function MacDeck:applyDisplays(s, displays)
-    s.displays = displays
-    s.display_index = 1
-    for i, d in ipairs(displays) do
-        if d.id == s.display_id then s.display_index = i end
+-- ── Agents ───────────────────────────────────────────────
+
+-- Agents 頁開著時定期問 Mac；資料沒變就不重畫（E-Ink 少閃）
+function MacDeck:pollAgents(s)
+    if s.poll then UIManager:unschedule(s.poll); s.poll = nil end -- 只換掉下一次輪詢；排著的重畫要保留
+    if self.session ~= s or s.page ~= "agents" or s.machine.state ~= S.CONTROL then return end
+    self:sendCommand(s, "agents.list", {}, nil, function(data)
+        self:applyAgents(s, data and data.sessions or {})
+    end)
+    s.poll = function()
+        s.poll = nil
+        self:pollAgents(s)
     end
-    s.display_id = displays[s.display_index] and displays[s.display_index].id or nil
-    s.display_page = math.floor((s.display_index - 1) / ControllerScreen.DISPLAYS_PER_PAGE) + 1
+    UIManager:scheduleIn(s.cfg.agents.poll_sec, s.poll)
+end
+
+function MacDeck:stopPolling(s)
+    if s.sync_tick then
+        UIManager:unschedule(s.sync_tick)
+        s.sync_tick = nil
+    end
+    if s.poll then
+        UIManager:unschedule(s.poll)
+        s.poll = nil
+    end
+    if s.redraw then
+        UIManager:unschedule(s.redraw)
+        s.redraw = nil
+    end
+end
+
+local function signature(agents)
+    local parts = {}
+    for _, a in ipairs(agents) do
+        local tasks = {}
+        for _, t in ipairs(a.tasks or {}) do tasks[#tasks + 1] = tostring(t.status) .. ":" .. tostring(t.text) end
+        parts[#parts + 1] = table.concat({ tostring(a.id), tostring(a.state), tostring(a.label), tostring(a.summary),
+            tostring(a.progress), tostring(a.prompt), tostring(a.step), table.concat(tasks, ",") }, "|")
+    end
+    return table.concat(parts, "\n")
+end
+
+--- session 數量由 Mac 回報、不固定；保留原本選的那個（找不到就選第一個）
+function MacDeck:applyAgents(s, agents)
+    if s.page ~= "agents" then return end
+    local sig = signature(agents)
+    if s.agents and sig == s.agents_sig then return end -- elapsed 每次都會變，不算
+    s.agents, s.agents_sig = agents, sig
+    s.agent_index = 1
+    for i, a in ipairs(agents) do
+        if a.id == s.agent_id then s.agent_index = i end
+    end
+    s.agent_id = agents[s.agent_index] and agents[s.agent_index].id or nil
+    s.agent_page = math.floor((s.agent_index - 1) / ControllerScreen.AGENTS_PER_PAGE) + 1
+    self:redrawWhenIdle(s)
+end
+
+-- 有按鈕正在回饋時先不換畫面，不然那次點擊會被丟掉
+function MacDeck:redrawWhenIdle(s)
+    if s.redraw then UIManager:unschedule(s.redraw) end
+    s.redraw = function()
+        s.redraw = nil
+        if self.session ~= s or s.page ~= "agents" or s.machine.state ~= S.CONTROL then return end
+        if W.pending_taps > 0 then return self:redrawWhenIdle(s) end
+        self:showScreen(s, self:controller(s, S.CONTROL))
+    end
+    UIManager:scheduleIn(W.pending_taps > 0 and 0.5 or 0, s.redraw)
+end
+
+local KEY_LABELS = { approve = "Approve", stop = "Stop", send = "Send", auto = "Auto", dictate = "Dictate", open = "Open" }
+
+function MacDeck:agentKey(s, key)
+    local a = s.agents and s.agents[s.agent_index]
+    if not a then return end
+    local label = string.format("%s → %s", KEY_LABELS[key] or key, a.project or "session")
+    local action, args = "agent.key", { session_id = a.id, key = key }
+    if key == "open" then action, args = "agent.open", { session_id = a.id } end
+    self:sendCommand(s, action, args, label, function()
+        if key ~= "open" then self:pollAgents(s) end -- 按完馬上更新狀態
+    end)
 end
 
 function MacDeck:applyVolume(s, data)
@@ -218,14 +344,6 @@ function MacDeck:setVolume(s, level)
     self:sendCommand(s, "volume.set", { level = level }, string.format("Volume %d%%", level), function(data)
         self:applyVolume(s, data)
     end)
-end
-
-function MacDeck:setBrightness(s, level)
-    local d = s.displays and s.displays[s.display_index]
-    if not d then return end
-    if s.screen then s.screen:setBrightness(level) end
-    self:sendCommand(s, "display.brightness.set", { display_id = d.id, level = level },
-        string.format("%s %d%%", d.name, level))
 end
 
 --- label = nil 時不顯示在狀態列（背景讀取用）；on_ok(data) 只在 ACK ok 時呼叫
@@ -252,6 +370,7 @@ function MacDeck:onMinute(s)
     local every = s.cfg.clock.full_refresh_min
     local full = every > 0 and s.minutes % every == 0
     s.screen:updateTime(full)
+    if self:syncDue(s) then self:syncInfo(s) end
 end
 
 -- ── Screens ──────────────────────────────────────────────
@@ -278,6 +397,7 @@ end
 function MacDeck:teardown(s)
     if self.session ~= s then return end
     self.session = nil
+    self:stopPolling(s)
     s.idle:cancel()
     s.connect_timeout:cancel()
     s.ticker:stop()

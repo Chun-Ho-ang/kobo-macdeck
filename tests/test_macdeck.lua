@@ -155,7 +155,7 @@ test("full flow: clock → control → command → idle → exit", function()
     eq(Stubs.errors, 0)
 end)
 
-test("media volume bar + monitor brightness", function()
+test("media volume bar", function()
     reset()
     local p = newPlugin(); p:start()
     U:top():onTapClock(); U:advance(1)
@@ -165,57 +165,90 @@ test("media volume bar + monitor brightness", function()
     bar:onTapSegmentBar(nil, { pos = { x = 100 + 820, y = 10 } }); U:advance(1)
     eq(p.session.transport.state.volume, 90, "9th segment = 90%")
     eq(U:top().volume_bar.value, 9)
-
-    tapButton(U:top(), "← Back"); tapButton(U:top(), "Monitor control")
-    U:advance(1)
-    local scr = U:top()
-    eq(#scr.display_buttons, 2, "two mock displays"); eq(scr.brightness_bar.value, 7, "builtin 70%")
-    tapButton(scr, "External display 1 · 50%")
-    scr = U:top(); eq(scr.display_index, 2); eq(scr.brightness_bar.value, 5)
-    tapButton(scr, "Brighter")
-    eq(p.session.transport.state.displays[2].brightness, 60)
-    local vb = scr.brightness_bar
-    vb.dimen = { x = 0, y = 0, w = 50, h = 1000 }
-    vb:onTapSegmentBar(nil, { pos = { x = 10, y = 950 } }); U:advance(1)
-    eq(p.session.transport.state.displays[2].brightness, 10, "bottom segment = 10%")
-    eq(scr.display_buttons[2].text, "External display 1 · 10%")
-    tapButton(scr, "Exit → KOReader"); eq(#U.tasks, 0); eq(#U.stack, 0)
+    tapButton(U:top(), "Exit → KOReader"); eq(#U.tasks, 0); eq(#U.stack, 0)
 end)
 
-test("variable display count: paging, refresh, hot-plug", function()
+local W = require("ui/widgets")
+local function tapCard(screen, project)
+    for _, card in pairs(screen.agent_cards or {}) do
+        if card.lines[1][1] == project then card:onTapBigButton(); U:advance(1); return end
+    end
+    error("card not found: " .. project)
+end
+
+test("agents: cards, detail, keys, polling", function()
     reset()
-    Stubs.user_config = { transport = { mock_display_count = 6 } }
     local p = newPlugin(); p:start()
     U:top():onTapClock(); U:advance(1)
-    tapButton(U:top(), "Monitor control"); U:advance(1)
-    local scr = U:top()
-    eq(#p.session.displays, 6)
-    assert(scr.display_buttons[4] and not scr.display_buttons[5], "page 1 shows 1-4")
+    tapButton(U:top(), "Agents"); U:advance(1)
+    local s, scr = p.session, U:top()
+    eq(#s.agents, 4)
+    local c = scr.agent_cards
+    assert(c[1].selected and not c[2].selected, "first selected")
+    assert(c[2].inverted and not c[1].inverted, "needs-you card is inverted")
+    assert(c[4].shaded, "error card is shaded")
+    eq(c[1].lines[2][1], "Working · 2/5")
+
+    tapCard(scr, "api-server"); scr = U:top()
+    eq(s.agent_id, "mock-2"); eq(scr.agent_index, 2)
+    tapButton(scr, "Approve"); U:advance(1); scr = U:top()
+    eq(s.transport.state.agents[2].state, "working", "approve went to the Mac")
+    assert(not scr.agent_cards[2].inverted, "refreshed right after the key")
+
+    -- 資料沒變：輪詢不重畫；有變：重畫
+    U:advance(5); eq(U:top(), scr, "no redraw when nothing changed")
+    s.transport.state.agents[1].summary = "Run: npm test"
+    U:advance(5); assert(U:top() ~= scr, "redraw on change")
+    eq(U:top().agent_cards[1].lines[3][1], "Run: npm test")
+
+    -- 按鈕回饋中不換畫面，點擊不會被吃掉
+    scr = U:top()
+    s.transport.state.agents[3].summary = "changed"
+    local function find(w)
+        if type(w) ~= "table" then return end
+        if w.onTapBigButton and w.text == "Stop" then return w end
+        for _, x in ipairs(w) do local r = find(x); if r then return r end end
+    end
+    find(scr):onTapBigButton()
+    p:pollAgents(s); U:advance(0.1)
+    eq(U:top(), scr, "redraw waits for the tap")
+    U:advance(1)
+    eq(W.pending_taps, 0)
+    assert(U:top() ~= scr, "redrawn after the tap finished")
+
+    -- Agents 頁不因閒置跳回時鐘
+    U:advance(300); eq(s.machine.state, "CONTROL")
+    tapButton(U:top(), "← Back"); U:advance(1)
+    U:advance(120); eq(s.machine.state, "CLOCK", "other pages still idle out")
+    tapButton(U:top(), "Exit → KOReader"); eq(#U.tasks, 0, "polling stopped")
+end)
+
+test("agents: variable count, paging, selection by id", function()
+    reset()
+    Stubs.user_config = { transport = { mock_agent_count = 6 } }
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Agents"); U:advance(1)
+    local s, scr = p.session, U:top()
+    assert(scr.agent_cards[4] and not scr.agent_cards[5], "page 1 shows 1-4")
     tapButton(scr, "›"); scr = U:top()
-    assert(scr.display_buttons[5] and scr.display_buttons[6], "page 2 shows 5-6")
-    tapButton(scr, "External display 5 · 50%"); scr = U:top()
-    eq(p.session.display_id, "5"); eq(scr.display_page, 2)
+    assert(scr.agent_cards[5] and scr.agent_cards[6], "page 2 shows 5-6")
+    tapCard(scr, "project-5")
+    eq(s.agent_id, "mock-5"); eq(U:top().agent_page, 2)
 
-    -- 拔掉兩台外接螢幕（1、2），選的那台還在，只是位置變了
-    local st = p.session.transport.state
-    table.remove(st.displays, 2); table.remove(st.displays, 2)
-    tapButton(scr, "Refresh"); U:advance(1); scr = U:top()
-    eq(#p.session.displays, 4); eq(p.session.display_id, "5"); eq(scr.display_index, 4)
-    eq(scr.display_page, 1, "fits on one page now")
-    assert(not scr.display_buttons[5], "no paging needed")
+    local st = s.transport.state
+    table.remove(st.agents, 1); table.remove(st.agents, 1)
+    U:advance(5); scr = U:top()
+    eq(#s.agents, 4); eq(s.agent_id, "mock-5"); eq(scr.agent_index, 3)
+    eq(scr.agent_page, 1, "fits on one page now")
 
-    -- 選的那台也拔掉 → 退回第一台
-    table.remove(st.displays, 4)
-    tapButton(scr, "Refresh"); U:advance(1)
-    eq(p.session.display_id, "builtin"); eq(U:top().display_index, 1)
+    table.remove(st.agents, 3)
+    U:advance(5)
+    eq(s.agent_id, "mock-3", "selected one gone → first")
 
-    -- 全部拔掉（理論上至少有內建，但 Mac 蓋上時可能是 0）
-    st.displays = {}
-    tapButton(U:top(), "Refresh"); U:advance(1)
-    eq(#p.session.displays, 0); eq(p.session.display_id, nil)
-    st.displays = { { id = "builtin", name = "Built-in display", brightness = 40 } }
-    tapButton(U:top(), "Refresh"); U:advance(1)
-    eq(#p.session.displays, 1, "refresh works from the empty state")
+    st.agents = {}
+    U:advance(5)
+    eq(#s.agents, 0); eq(s.agent_id, nil); eq(next(U:top().agent_cards or {}), nil)
     tapButton(U:top(), "Exit → KOReader"); eq(#U.tasks, 0)
 end)
 
@@ -252,7 +285,7 @@ end)
 
 test("clock refreshes every minute and does periodic full refresh", function()
     reset()
-    Stubs.user_config = { clock = { full_refresh_min = 2 } }
+    Stubs.user_config = { clock = { full_refresh_min = 2, sync_min = 0 } }
     local p = newPlugin(); p:start()
     local screen, calls, fulls = U:top(), 0, 0
     local orig = screen.updateTime
@@ -260,6 +293,46 @@ test("clock refreshes every minute and does periodic full refresh", function()
     U:advance(20 + 60 * 3 + 1) -- 1000 秒起算，20 秒後是第一個整分
     eq(calls, 4); eq(fulls, 2)
     p:teardown(p.session); eq(#U.tasks, 0)
+end)
+
+test("clock syncs weather / next event from the Mac", function()
+    reset()
+    Stubs.user_config = { clock = { sync_min = 15 } }
+    local p = newPlugin(); p:start()
+    local s = p.session
+    U:advance(1)
+    local scr = U:top()
+    eq(scr.info.weather.temp, 17)
+    eq(scr:weatherLines()[1][1], "17°C  Overcast")
+    eq(scr:weatherLines()[2][1], "H 23° · L 9° · Ann Arbor")
+    eq(scr:eventLines()[1][1], "Design review")
+    eq(scr:eventLines()[2][1], "Today 14:00–15:00")
+    assert(scr:syncLine():match("^Data: synced "), scr:syncLine())
+    eq(s.transport.connected, false, "disconnects after syncing")
+
+    -- 下一次同步前 Mac 連不上：保留舊資料，底部顯示原因
+    s.transport.fail_connect = true
+    U:advance(15 * 60 + 60)
+    scr = U:top()
+    eq(scr.info.weather.temp, 17, "old data kept")
+    eq(scr:syncLine(), "Data: mock: connect failed")
+
+    -- Mac 那邊沒設定位置、行事曆權限沒開
+    s.transport.fail_connect = false
+    s.transport.handle = function() return "ok", "info", {
+        weather = { error = "Set a location on the Mac" }, event_error = "Allow Calendar access for Terminal" } end
+    U:advance(15 * 60 + 60)
+    scr = U:top()
+    eq(scr:weatherLines()[1][1], "Set a location on the Mac")
+    eq(scr:eventLines()[1][1], "Allow Calendar access for Terminal")
+    p:teardown(s); eq(#U.tasks, 0)
+
+    -- sync_min = 0：完全不連線
+    reset()
+    Stubs.user_config = { clock = { sync_min = 0 } }
+    p = newPlugin(); p:start(); U:advance(3600)
+    eq(U:top().info, nil); eq(U:top():syncLine(), "Data: not synced")
+    p:teardown(p.session)
 end)
 
 test("start twice / keep orientation", function()
@@ -287,7 +360,7 @@ Wifi.json = { encode = function(t) return t end, decode = function(t) return t e
 
 local function fakeMac(opts)
     opts = opts or {}
-    local mac = Interface.mock{ ui_manager = U, display_count = 3 }
+    local mac = Interface.mock{ ui_manager = U, agent_count = 3 }
     local fake = { requests = 0, down = false }
     fake.post = function(url, headers, msg, timeout)
         fake.requests = fake.requests + 1
@@ -323,8 +396,8 @@ test("wifi: connect, read state, send commands", function()
     tapButton(U:top(), "Media control")
     eq(p.session.media.level, 50, "volume.get over wifi")
     tapButton(U:top(), "Vol +"); eq(p.session.media.level, 60)
-    tapButton(U:top(), "← Back"); tapButton(U:top(), "Monitor control")
-    eq(#p.session.displays, 3)
+    tapButton(U:top(), "← Back"); tapButton(U:top(), "Agents")
+    eq(#p.session.agents, 3)
     tapButton(U:top(), "Exit → KOReader")
     eq(p.session, nil); eq(#U.tasks, 0)
 end)

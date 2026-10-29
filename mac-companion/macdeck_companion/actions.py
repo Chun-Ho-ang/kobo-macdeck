@@ -1,20 +1,21 @@
 """Whitelisted actions. Never pass arbitrary strings to a shell.
 
 Current scope: media control (previous / play-pause / next, volume, mute)
-and monitor control (list displays, set brightness).
+the agent deck (Claude Code session status, a few fixed keys), and clock info
+(weather, next calendar event; read-only).
 """
 
 import re
-import shutil
 import subprocess
+import time
 from typing import Optional
+
+from .agents import BUNDLE_ID, SESSION_ID, AgentHub
+from .info import NextEvent, Weather
 
 
 class ActionError(Exception):
     pass
-
-
-DISPLAY_ID = re.compile(r"^(builtin|\d{1,2})$")
 
 
 def _level(args: dict) -> int:
@@ -24,10 +25,39 @@ def _level(args: dict) -> int:
     return max(0, min(100, int(round(level))))
 
 
+# Agent 鍵：固定的 System Events 指令，Kobo 只能從這幾個裡面選
+KEYS = {
+    "approve": 'tell application "System Events" to key code 36',  # Return
+    "send": 'tell application "System Events" to key code 36',  # Return
+    "stop": 'tell application "System Events" to key code 53',  # Escape
+    "auto": 'tell application "System Events" to key code 48 using shift down',  # Shift+Tab：切換權限模式
+}
+MODIFIERS = ("command", "control", "option", "shift")
+
+
+def dictation_script(spec) -> Optional[str]:
+    """config.dictation_key = {"key": "d", "modifiers": ["control", "option"]}
+    （對應 系統設定 → 鍵盤 → 聽寫 → 快速鍵 → 自訂）"""
+    if not isinstance(spec, dict):
+        return None
+    key, mods = spec.get("key"), spec.get("modifiers", [])
+    if not isinstance(key, str) or not re.match(r"^[a-z0-9]$", key):
+        return None
+    if not isinstance(mods, list) or not mods or any(m not in MODIFIERS for m in mods):
+        return None
+    using = ", ".join(f"{m} down" for m in dict.fromkeys(mods))
+    return f'tell application "System Events" to keystroke "{key}" using {{{using}}}'
+
+
 class Actions:
-    def __init__(self, config: dict, dry_run: bool = True):
+    def __init__(self, config: dict, dry_run: bool = True, hub: Optional[AgentHub] = None,
+                 weather: Optional[Weather] = None, calendar: Optional[NextEvent] = None):
         self.player = config.get("media_player", "Music")
+        self.dictation = dictation_script(config.get("dictation_key"))
         self.dry_run = dry_run
+        self.hub = hub or AgentHub()
+        self.weather = weather or Weather(config)
+        self.calendar = calendar or NextEvent()
         self.handlers = {
             "media.previous": self.media_previous,
             "media.toggle": self.media_toggle,
@@ -35,18 +65,13 @@ class Actions:
             "volume.get": self.volume_get,
             "volume.set": self.volume_set,
             "audio.mute": self.audio_mute,
-            "display.list": self.display_list,
-            "display.brightness.set": self.display_brightness_set,
+            "agents.list": self.agents_list,
+            "agent.key": self.agent_key,
+            "agent.open": self.agent_open,
+            "info.get": self.info_get,
         }
         # dry-run 時用假狀態回應，讓 Kobo 端可以完整測試
-        self._fake = {
-            "volume": 50,
-            "muted": False,
-            "displays": [
-                {"id": "builtin", "name": "Built-in display", "brightness": 70},
-                {"id": "1", "name": "External display", "brightness": 50},
-            ],
-        }
+        self._fake = {"volume": 50, "muted": False}
 
     def execute(self, action: str, args: dict) -> tuple[str, Optional[dict]]:
         handler = self.handlers.get(action)
@@ -104,41 +129,55 @@ class Actions:
         self._fake["muted"] = not self._fake["muted"]
         return "mute toggled", self.volume_get({})[1]
 
-    # ── monitors ──
-    # 內建螢幕：brew install brightness；外接螢幕（DDC/CI）：brew install m1ddc
+    # ── clock info ──
+    # 只讀資料，dry-run 也是真的；各自有快取（天氣 15 分鐘、行事曆 2 分鐘）
 
-    def display_list(self, args):
-        if self.dry_run:
-            return f"{len(self._fake['displays'])} displays", {"displays": [dict(d) for d in self._fake["displays"]]}
-        displays = []
-        if shutil.which("brightness"):
-            m = re.search(r"brightness (\d*\.?\d+)", self._run(["brightness", "-l"]))
-            displays.append({"id": "builtin", "name": "Built-in display",
-                             "brightness": round(float(m.group(1)) * 100) if m else None})
-        if shutil.which("m1ddc"):
-            for line in self._run(["m1ddc", "display", "list"]).splitlines():
-                m = re.match(r"\s*\[(\d{1,2})\]\s+(.+?)\s*(\(.*\))?\s*$", line)
-                if m:
-                    displays.append({"id": m.group(1), "name": m.group(2),
-                                     "brightness": self._ddc_luminance(m.group(1))})
-        return f"{len(displays)} displays", {"displays": displays}
+    def info_get(self, args):
+        event = self.calendar.get()
+        return "info", {
+            "weather": self.weather.get(),
+            "event": event.get("event"),
+            "event_error": event.get("error"),
+            "synced": time.strftime("%H:%M"),
+        }
 
-    def _ddc_luminance(self, display_id: str):
-        try:
-            return int(self._run(["m1ddc", "display", display_id, "get", "luminance"]).strip())
-        except (ValueError, subprocess.SubprocessError, OSError):
-            return None
+    # ── agents ──
+    # 狀態來自 Claude Code hooks（真實資料，dry-run 也一樣）；按鍵在 dry-run 時不會送出
 
-    def display_brightness_set(self, args):
-        display_id = args.get("display_id")
-        if not isinstance(display_id, str) or not DISPLAY_ID.match(display_id):
-            raise ActionError("invalid display_id")
-        level = _level(args)
-        if display_id == "builtin":
-            self._run(["brightness", f"{level / 100:.2f}"])
+    def agents_list(self, args):
+        sessions = self.hub.snapshot()
+        return f"{len(sessions)} sessions", {"sessions": sessions}
+
+    def _session(self, args) -> str:
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not SESSION_ID.match(sid) or not self.hub.exists(sid):
+            raise ActionError("unknown session")
+        return sid
+
+    def _focus(self, sid: str) -> None:
+        app = self.hub.app_for(sid)
+        if not app or not BUNDLE_ID.match(app):
+            raise ActionError("don't know which app runs this session")
+        self._run(["open", "-b", app])
+        if not self.dry_run:
+            time.sleep(0.4)  # 等視窗真的到前景再送按鍵
+
+    def agent_open(self, args):
+        sid = self._session(args)
+        self._focus(sid)
+        return "opened", None
+
+    def agent_key(self, args):
+        sid = self._session(args)
+        key = args.get("key")
+        if key == "dictate":
+            if not self.dictation:
+                raise ActionError("set dictation_key in config.json")
+            script = self.dictation
+        elif key in KEYS:
+            script = KEYS[key]
         else:
-            self._run(["m1ddc", "display", display_id, "set", "luminance", str(level)])
-        for d in self._fake["displays"]:
-            if d["id"] == display_id:
-                d["brightness"] = level
-        return f"display {display_id} brightness {level}", {"display_id": display_id, "brightness": level}
+            raise ActionError("unknown key")
+        self._focus(sid)
+        self._osascript(script)
+        return key, None

@@ -16,6 +16,7 @@ local W = require("ui/widgets")
 local ClockScreen = W.ScreenBase:extend{
     name = "macdeck_clock",
     cfg = nil,
+    info = nil, -- Mac 同步來的 { weather, event, event_error, synced } + error；nil = 還沒同步過
     on_control = nil,
     on_exit = nil,
 }
@@ -56,6 +57,37 @@ function ClockScreen:formatZone()
     return location ~= "" and (location .. " · " .. zone) or zone
 end
 
+function ClockScreen:weatherLines()
+    local w = self.info and self.info.weather
+    if not w then return { { "—", 18 } } end
+    if w.error then return { { w.error, 14 } } end
+    local deg = "°" .. (w.unit or "")
+    local where = (w.location and w.location ~= "") and (" · " .. w.location) or ""
+    return {
+        { string.format("%d%s  %s", w.temp or 0, deg, w.text or ""), 22, true },
+        { string.format("H %d° · L %d°%s", w.high or 0, w.low or 0, where), 14 },
+    }
+end
+
+function ClockScreen:eventLines()
+    local info = self.info
+    if not info or (not info.event and not info.event_error) then
+        return { { info and info.synced and "No upcoming events" or "—", info and 16 or 18 } }
+    end
+    if not info.event then return { { info.event_error, 14 } } end
+    local e = info.event
+    local lines = { { e.title or "", 20, true }, { e.when or "", 16 } }
+    if e.location and e.location ~= "" then table.insert(lines, { e.location, 14 }) end
+    return lines
+end
+
+function ClockScreen:syncLine()
+    local info = self.info
+    if not info then return "Data: not synced" end
+    if info.error then return "Data: " .. info.error end
+    return "Data: synced " .. (info.synced or "")
+end
+
 function ClockScreen:init()
     local m = W.metrics()
     local body_h = m.inner_h - m.header_h - m.footer_h - 2 * m.gap
@@ -90,13 +122,15 @@ function ClockScreen:init()
 
     local tile_h = math.floor((body_h - m.gap) / 2)
     local info_w = right_w - 2 * m.pad - 2 * m.border
-    local function infoTile(title, value, h)
-        return W.tile(right_w, h, VerticalGroup:new{
+    -- lines = { { text, size, bold }, ... }
+    local function infoTile(title, lines, h)
+        local group = VerticalGroup:new{
             align = "left",
             W.text(title, 14, true, info_w),
             VerticalSpan:new{ width = math.floor(m.gap / 2) },
-            W.text(value, 18, false, info_w),
-        })
+        }
+        for _, l in ipairs(lines) do table.insert(group, W.text(l[1], l[2] or 16, l[3], info_w)) end
+        return W.tile(right_w, h, group)
     end
 
     local body = HorizontalGroup:new{
@@ -104,9 +138,9 @@ function ClockScreen:init()
         W.tile(left_w, body_h, left_content),
         HorizontalSpan:new{ width = m.gap },
         VerticalGroup:new{
-            infoTile("WEATHER", "—° · Synced —", tile_h), -- TODO(Phase 4): services/weather
+            infoTile("WEATHER", self:weatherLines(), tile_h),
             VerticalSpan:new{ width = m.gap },
-            infoTile("NEXT EVENT", "No event data", body_h - m.gap - tile_h), -- TODO(Phase 4): services/calendar
+            infoTile("NEXT EVENT", self:eventLines(), body_h - m.gap - tile_h),
         },
     }
 
@@ -114,7 +148,7 @@ function ClockScreen:init()
     local footer = HorizontalGroup:new{
         LeftContainer:new{
             dimen = Geom:new{ w = m.inner_w - exit_w - m.gap, h = m.footer_h },
-            W.text("Data: not synced", 14, false, m.inner_w - exit_w - m.gap),
+            W.text(self:syncLine(), 14, false, m.inner_w - exit_w - m.gap),
         },
         HorizontalSpan:new{ width = m.gap },
         W.buttonRow({ { text = "Exit → KOReader", callback = self.on_exit } },

@@ -143,8 +143,10 @@ function W.BigButton:onTapBigButton()
     local parent = self.show_parent
     self.frame.invert = true
     UIManager:setDirty(parent, "fast", self.dimen)
+    W.pending_taps = W.pending_taps + 1
     self._pending = function()
         self._pending = nil
+        W.pending_taps = W.pending_taps - 1
         self.frame.invert = false
         UIManager:setDirty(parent, "ui", self.dimen)
         self.callback()
@@ -163,7 +165,53 @@ function W.BigButton:onCloseWidget()
     if self._pending then
         UIManager:unschedule(self._pending)
         self._pending = nil
+        W.pending_taps = W.pending_taps - 1
     end
+end
+
+-- 還在按鈕回饋中的點擊數；背景更新要等它歸零再重畫，否則會把那次點擊吃掉
+W.pending_taps = 0
+
+-- 多行卡片按鈕（Agents 的 session 格）：lines = { { text, size, bold }, ... }
+-- selected = 粗框；inverted = 黑底白字（需要你處理）；shaded = 淺灰底（出錯）
+W.Card = W.BigButton:extend{
+    lines = nil,
+    inverted = false,
+    shaded = false,
+}
+
+function W.Card:init()
+    local m = W.metrics()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+    local border = self.selected and m.border * 3 or m.border
+    local text_w = self.width - 2 * border - 2 * m.pad
+    local group = VerticalGroup:new{ align = "left" }
+    for i, line in ipairs(self.lines or {}) do
+        if i > 1 then table.insert(group, VerticalSpan:new{ width = math.floor(m.gap / 3) }) end
+        local t = W.text(line[1], line[2] or 14, line[3], text_w)
+        if self.inverted then t.fgcolor = Blitbuffer.COLOR_WHITE end
+        table.insert(group, t)
+    end
+    local background = Blitbuffer.COLOR_WHITE
+    if self.inverted then
+        background = Blitbuffer.COLOR_BLACK
+    elseif self.shaded then
+        background = Blitbuffer.COLOR_LIGHT_GRAY
+    end
+    self.frame = FrameContainer:new{
+        bordersize = border,
+        padding = 0,
+        margin = 0,
+        background = background,
+        LeftContainer:new{
+            dimen = Geom:new{ w = self.width - 2 * border, h = self.height - 2 * border },
+            HorizontalGroup:new{ HorizontalSpan:new{ width = m.pad }, group },
+        },
+    }
+    self[1] = self.frame
+    self.ges_events = {
+        TapBigButton = { GestureRange:new{ ges = "tap", range = function() return self.dimen end } },
+    }
 end
 
 -- 分段滑軌：E-Ink 不適合拖曳，改成點哪一格就設到哪一格（1..segments）

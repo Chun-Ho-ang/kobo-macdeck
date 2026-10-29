@@ -1,7 +1,7 @@
 -- 統一 transport 介面：每個 transport 物件提供
 --   connect(on_done(ok, err))、send(action, args, on_ack(ack))、disconnect()
--- ACK 可帶 data（例如 volume.get、display.list 的結果）
--- Phase 1 只有 mock：模擬 Mac 端的音量與螢幕狀態
+-- ACK 可帶 data（例如 volume.get、agents.list 的結果）
+-- mock：模擬 Mac 端的音量與 Claude Code session 狀態
 local M = {}
 
 M.PROTOCOL = "macdeck/1"
@@ -26,19 +26,43 @@ end
 local Mock = {}
 Mock.__index = Mock
 
-local function mockDisplays(count)
+local MOCK_AGENTS = {
+    { project = "kobo-macdeck", state = "working", label = "Working", summary = "Edit wifi.lua", progress = "2/5",
+      elapsed = "4m 12s", prompt = "Add Wi-Fi transport", step = "Edit transport/wifi.lua",
+      tasks = {
+          { text = "Read transport and server", status = "completed" },
+          { text = "Add pairing token", status = "completed" },
+          { text = "Implement Wi-Fi transport", status = "in_progress" },
+          { text = "Add tests", status = "pending" },
+          { text = "Update README", status = "pending" },
+      } },
+    { project = "api-server", state = "waiting", label = "Needs you", summary = "Allow Run: npm test?", progress = "",
+      elapsed = "1m 03s", prompt = "Fix the failing login test", step = "Run: npm test", tasks = {} },
+    { project = "blog", state = "done", label = "Done", summary = "12 min ago", progress = "3/3",
+      elapsed = "6m 40s", prompt = "Write the October post", step = "", tasks = {} },
+    { project = "infra", state = "error", label = "Error", summary = "rate_limit", progress = "",
+      elapsed = "0m 20s", prompt = "Bump Terraform providers", step = "", tasks = {} },
+}
+
+local function copy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = copy(x) end
+    return out
+end
+
+local function mockAgents(count)
     local list = {}
     for i = 1, count do
-        if i == 1 then
-            list[i] = { id = "builtin", name = "Built-in display", brightness = 70 }
-        else
-            list[i] = { id = tostring(i - 1), name = "External display " .. (i - 1), brightness = 50 }
-        end
+        local a = copy(MOCK_AGENTS[i] or { project = "project-" .. i, state = "done", label = "Done",
+            summary = "1 h ago", progress = "", elapsed = "2m 00s", prompt = "", step = "", tasks = {} })
+        a.id = "mock-" .. i
+        list[i] = a
     end
     return list
 end
 
---- opts: ui_manager, connect_delay_sec, fail_connect, display_count
+--- opts: ui_manager, connect_delay_sec, fail_connect, agent_count
 function M.mock(opts)
     return setmetatable({
         ui = opts.ui_manager,
@@ -48,7 +72,7 @@ function M.mock(opts)
         state = {
             volume = 50,
             muted = false,
-            displays = mockDisplays(opts.display_count or 2),
+            agents = mockAgents(opts.agent_count or 4),
         },
     }, Mock)
 end
@@ -73,19 +97,24 @@ function Mock:handle(action, args)
     elseif action == "audio.mute" then
         st.muted = not st.muted
         return "ok", st.muted and "muted" or "unmuted", { level = st.volume, muted = st.muted }
-    elseif action == "display.list" then
-        local list = {}
-        for i, d in ipairs(st.displays) do list[i] = { id = d.id, name = d.name, brightness = d.brightness } end
-        return "ok", #list .. " displays", { displays = list }
-    elseif action == "display.brightness.set" then
-        local level = clampLevel(args.level)
-        for _, d in ipairs(st.displays) do
-            if d.id == args.display_id and level then
-                d.brightness = level
-                return "ok", d.name .. " " .. level, { display_id = d.id, brightness = level }
+    elseif action == "info.get" then
+        return "ok", "info", {
+            weather = { temp = 17, text = "Overcast", high = 23, low = 9, unit = "C", location = "Ann Arbor" },
+            event = { title = "Design review", when = "Today 14:00–15:00", location = "Room 3" },
+            synced = os.date("%H:%M"),
+        }
+    elseif action == "agents.list" then
+        return "ok", #st.agents .. " sessions", { sessions = copy(st.agents) }
+    elseif action == "agent.key" or action == "agent.open" then
+        for _, a in ipairs(st.agents) do
+            if a.id == args.session_id then
+                if action == "agent.key" and args.key == "approve" and a.state == "waiting" then
+                    a.state, a.label, a.summary = "working", "Working", a.step
+                end
+                return "ok", (args.key or "opened") .. " (mock)"
             end
         end
-        return "error", "unknown display or level"
+        return "error", "unknown session"
     end
     return "error", "action not allowed: " .. tostring(action)
 end

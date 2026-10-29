@@ -25,9 +25,14 @@ kobo-macdeck/
 
 - KOReader 主選單 → 工具 → **MacDeck** 啟動
 - 啟動後轉橫向、顯示 Clock；每分鐘對齊整分刷新時間區塊，每 30 分鐘全刷一次
-- 點 Clock 任一處 → Connecting（mock 0.5 秒）→ Controller 首頁：**Media control** / **Monitor control**
+- Clock 右側的 Weather / Next event：每 `clock.sync_min`（預設 15）分鐘短暫連一次 Mac 拿資料，拿完就斷線；連不上時保留舊資料，底部顯示原因。Mac 端設定見 `mac-companion/README.md`「時鐘的天氣與行程」
+- 點 Clock 任一處 → Connecting（mock 0.5 秒）→ Controller 首頁：**Media control** / **Agents**
   - Media：上一首 / 播放暫停 / 下一首；音量條（點哪格設到哪，10 格 = 10%）+ 小聲 / 大聲 / 靜音
-  - Monitor：左邊選螢幕，右邊亮度條 + 亮 / 暗。螢幕數量由 Mac 回報、不固定：超過 4 台自動分頁（‹ / ›），插拔螢幕後按 Refresh 重新讀取，原本選的那台會保留（以 id 辨識）
+  - Agents（Codex Micro 風格）：左邊 2×2 格是 Mac 上的 Claude Code session，右邊是選中那個的進度（任務清單、目前動作），下排 Auto / Approve / Stop / Open / Dictate / Send
+    - 黑底白字＝需要你處理；淺灰底＝出錯；粗框＝目前選的
+    - 數量不固定，超過 4 個自動分頁；每 `agents.poll_sec`（預設 5 秒）更新一次，資料沒變不重畫
+    - 預設不因閒置跳回 Clock（`agents.stay_open`），可以當桌上的狀態板
+    - 資料來源與安裝見 `mac-companion/README.md`「Agents」
   - 點按鈕會反白並在底部顯示 ACK；子頁底列有 ← Back / ← Clock / Exit
 - Controller 60 秒沒觸控 → 回 Clock；Clock / Controller / Connecting / Offline 都有 Exit
 - Exit、畫面被系統關閉、或內部出錯時，都會清掉計時器並還原螢幕方向
@@ -50,7 +55,9 @@ return {
         -- 連真的 Mac（Phase 2，見下方「Wi-Fi 連線」）：
         -- transport = { preferred = "wifi", wifi = { host = "10.0.0.40", token = "<token.txt 的內容>" } },
         -- transport = { mock_fail_connect = true }, -- 測 Offline 畫面
-        -- transport = { mock_display_count = 6 }, -- 測多螢幕分頁
+        -- clock = { sync_min = 30 }, -- 天氣 / 行程多久同步一次；0 = 不同步
+        -- transport = { mock_agent_count = 6 }, -- 測 Agents 分頁
+        -- agents = { poll_sec = 10, stay_open = false },
     },
 }
 ```

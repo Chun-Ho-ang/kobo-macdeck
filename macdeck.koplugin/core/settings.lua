@@ -18,6 +18,7 @@ M.DEFAULTS = {
         -- 空字串 = 自動（例如 "EDT · UTC−04:00"）；Kobo 系統時區不可靠時可手動填，例如 "Detroit time"
         timezone_label = "",
         full_refresh_min = 30, -- 每 N 分鐘做一次全刷消殘影；0 = 關閉
+        sync_min = 15, -- 時鐘畫面每 N 分鐘向 Mac 拿一次天氣 / 下一個行程；0 = 不同步
     },
     idle = { controller_timeout_sec = 60 },
     transport = {
@@ -31,7 +32,11 @@ M.DEFAULTS = {
         },
         mock_connect_delay_sec = 0.5,
         mock_fail_connect = false, -- 設為 true 可測 OFFLINE 畫面（T-05）
-        mock_display_count = 2, -- 假螢幕數量（含內建），用來測多螢幕分頁
+        mock_agent_count = 4, -- 假 Claude Code session 數量，用來測分頁
+    },
+    agents = {
+        poll_sec = 5, -- Agents 頁開著時每幾秒問一次 Mac
+        stay_open = true, -- Agents 頁不因閒置跳回時鐘（當成桌面狀態板）
     },
 }
 
@@ -76,8 +81,10 @@ function M.validate(cfg)
     end
     cfg.transport.wifi.port = clamp(math.floor(cfg.transport.wifi.port), 1, 65535)
     cfg.transport.wifi.request_timeout_sec = clamp(cfg.transport.wifi.request_timeout_sec, 1, 10)
-    cfg.transport.mock_display_count = clamp(math.floor(cfg.transport.mock_display_count), 0, 16)
+    cfg.transport.mock_agent_count = clamp(math.floor(cfg.transport.mock_agent_count), 0, 12)
+    cfg.agents.poll_sec = clamp(cfg.agents.poll_sec, 2, 300)
     cfg.clock.full_refresh_min = clamp(cfg.clock.full_refresh_min, 0, 24 * 60)
+    cfg.clock.sync_min = clamp(math.floor(cfg.clock.sync_min), 0, 24 * 60)
     if cfg.ui.landscape_rotation ~= 1 and cfg.ui.landscape_rotation ~= 3 then
         cfg.ui.landscape_rotation = 1
     end

@@ -95,7 +95,7 @@ function Stubs.install()
     P["ui/geometry"] = function() return { new = function(_, o) return geom(o) end } end
     P["ui/gesturerange"] = function() return { new = function(_, o) return o end } end
     P["ui/font"] = function() return { getFace = function(_, n, s) return { name = n, size = s } end } end
-    P["ffi/blitbuffer"] = function() return { COLOR_WHITE = 0, COLOR_BLACK = 1, COLOR_DARK_GRAY = 2 } end
+    P["ffi/blitbuffer"] = function() return { COLOR_WHITE = 0, COLOR_BLACK = 1, COLOR_DARK_GRAY = 2, COLOR_LIGHT_GRAY = 3 } end
     P["ui/widget/textwidget"] = function() return TextWidget end
     for _, m in ipairs({
         "ui/widget/container/widgetcontainer", "ui/widget/container/inputcontainer",

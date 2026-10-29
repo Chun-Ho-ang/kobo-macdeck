@@ -1,5 +1,5 @@
 -- Mac 控制畫面
--- mode = CONNECTING / CONTROL / OFFLINE；CONTROL 再分成 page = home / media / monitor
+-- mode = CONNECTING / CONTROL / OFFLINE；CONTROL 再分成 page = home / media / agents
 -- 每個畫面底列都保留 Clock 與 Exit
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -21,17 +21,16 @@ local ControllerScreen = W.ScreenBase:extend{
     status = "",
     message = nil, -- OFFLINE 時的錯誤說明
     media = nil, -- { level = 0..100 或 nil, muted = bool }
-    displays = nil, -- nil = 讀取中；{ { id, name, brightness }, ... }
-    display_index = 1, -- 在完整清單中的位置
-    display_page = 1, -- 螢幕清單分頁（螢幕數量不固定）
+    agents = nil, -- nil = 讀取中；{ { id, project, state, label, summary, progress, elapsed, prompt, step, tasks }, ... }
+    agent_index = 1, -- 在完整清單中的位置
+    agent_page = 1, -- session 數量不固定，超過一頁就分頁
     on_activity = nil, -- 任何觸控都呼叫，用來重設閒置逾時
     on_page = nil, -- function(page)
     on_command = nil, -- function(action, args, label)
     on_volume = nil, -- function(level)
-    on_select_display = nil, -- function(index)
-    on_brightness = nil, -- function(level)
+    on_select_agent = nil, -- function(index)
+    on_agent_key = nil, -- function(key)：approve / stop / send / auto / dictate / open
     on_list_page = nil, -- function(delta)
-    on_refresh = nil, -- 重新向 Mac 讀取螢幕清單（插拔螢幕後）
     on_retry = nil,
     on_clock = nil,
     on_exit = nil,
@@ -46,11 +45,14 @@ local STATUS = {
 local TITLES = {
     home = "MAC CONTROL",
     media = "MEDIA CONTROL",
-    monitor = "MONITOR CONTROL",
+    agents = "AGENTS",
 }
 
--- 每頁最多幾台螢幕；超過就分頁，按鈕維持夠大好點
-ControllerScreen.DISPLAYS_PER_PAGE = 4
+-- 左邊 2×2 格；超過就分頁
+ControllerScreen.AGENTS_PER_PAGE = 4
+
+-- 任務清單符號（KOReader 的備援字型 FreeSans 有這幾個字）
+local TASK_MARK = { completed = "✓", in_progress = "▶", pending = "○" }
 
 local function toSegments(level)
     if level == nil then return 0 end
@@ -90,7 +92,7 @@ function ControllerScreen:buildHome(width, height)
     return HorizontalGroup:new{
         self:button("Media control", w, height, self:tap(self.on_page, "media"), { font_size = 26 }),
         HorizontalSpan:new{ width = m.gap },
-        self:button("Monitor control", width - m.gap - w, height, self:tap(self.on_page, "monitor"), { font_size = 26 }),
+        self:button("Agents", width - m.gap - w, height, self:tap(self.on_page, "agents"), { font_size = 26 }),
     }
 end
 
@@ -164,109 +166,151 @@ function ControllerScreen:buildMedia(width, height)
     }
 end
 
-function ControllerScreen:displayLabel(d)
-    if d.brightness == nil then return d.name end
-    return string.format("%s · %d%%", d.name, d.brightness)
+function ControllerScreen:agentCard(a, w, h, index)
+    local state = a.label or a.state or ""
+    if a.progress and a.progress ~= "" then state = state .. " · " .. a.progress end
+    return W.Card:new{
+        width = w,
+        height = h,
+        lines = { { a.project or "session", 16, true }, { state, 14, true }, { a.summary or "", 14 } },
+        selected = index == self.agent_index,
+        inverted = a.state == "waiting",
+        shaded = a.state == "error",
+        callback = self:tap(self.on_select_agent, index),
+        show_parent = self,
+        feedback_ms = self.cfg.ui.feedback_ms,
+    }
 end
 
--- 左邊：螢幕選擇；右邊：所選螢幕的亮度條 + 亮 / 暗
-function ControllerScreen:buildMonitor(width, height)
+--- 右邊：選中 session 的進度（任務清單會依高度裁切，保留目前在做的那項）
+function ControllerScreen:agentDetail(a, w, h)
     local m = W.metrics()
-    local displays = self.displays
-    if displays == nil or #displays == 0 then
+    local text_w = w - 2 * m.border - 2 * m.pad
+    local group = VerticalGroup:new{ align = "left" }
+    local used = 0
+    local function add(text, size, bold)
+        local t = W.text(text, size, bold, text_w)
+        table.insert(group, t)
+        used = used + t:getSize().h
+        return t
+    end
+    add(a.project or "session", 18, true)
+    add(string.format("%s · %s", a.label or "", a.elapsed or ""), 14)
+    if a.prompt and a.prompt ~= "" then add("“" .. a.prompt .. "”", 14) end
+    table.insert(group, VerticalSpan:new{ width = m.gap })
+    used = used + m.gap
+
+    local tasks = a.tasks or {}
+    local probe = W.text("Ag", 14)
+    local line_h = probe:getSize().h
+    probe:free()
+    local footer_h = (a.step and a.step ~= "") and (line_h + m.gap) or 0
+    local room = math.max(0, math.floor((h - 2 * m.border - 2 * m.pad - used - footer_h) / line_h))
+    local first = 1
+    if #tasks > room then
+        local current = #tasks
+        for i, t in ipairs(tasks) do
+            if t.status ~= "completed" then current = i; break end
+        end
+        first = math.max(1, math.min(current - 1, #tasks - room + 1))
+    end
+    for i = first, math.min(#tasks, first + room - 1) do
+        local t = tasks[i]
+        add((TASK_MARK[t.status] or "○") .. "  " .. (t.text or ""), 14, t.status == "in_progress")
+    end
+    if #tasks == 0 then add("No task list", 14) end
+    if footer_h > 0 then
+        table.insert(group, VerticalSpan:new{ width = m.gap })
+        add("Now: " .. a.step, 14)
+    end
+    return W.tile(w, h, group)
+end
+
+-- 左：session 格（2×2，可翻頁）；右：選中那格的進度；下：Codex Micro 風格的按鍵列
+function ControllerScreen:buildAgents(width, height)
+    local m = W.metrics()
+    local agents = self.agents
+    if agents == nil or #agents == 0 then
         local group = VerticalGroup:new{ align = "center" }
-        table.insert(group, W.text(displays == nil and "Looking for displays…" or "No displays found",
-            24, true, width - 4 * m.pad))
-        if displays ~= nil then
-            table.insert(group, VerticalSpan:new{ width = m.gap * 2 })
-            table.insert(group, W.buttonRow({ { text = "Refresh", callback = self:tap(self.on_refresh) } },
-                math.floor(width / 3), m.footer_h, self, self.cfg.ui.feedback_ms))
+        table.insert(group, W.text(agents == nil and "Looking for Claude Code sessions…" or "No active sessions",
+            22, true, width - 4 * m.pad))
+        if agents ~= nil then
+            table.insert(group, VerticalSpan:new{ width = m.gap })
+            table.insert(group, W.text("Start Claude Code on the Mac with the MacDeck hooks installed", 14, false,
+                width - 4 * m.pad))
         end
         return W.tile(width, height, group, { center = true })
     end
 
-    local list_w = math.floor((width - m.gap) * 0.6)
-    local right_w = width - m.gap - list_w
-    local per_page = ControllerScreen.DISPLAYS_PER_PAGE
-    local pages = math.max(1, math.ceil(#displays / per_page))
-    local page = math.max(1, math.min(self.display_page or 1, pages))
+    local keys_h = m.footer_h
+    local main_h = height - keys_h - m.gap
+    local left_w = math.floor((width - m.gap) / 2)
+    local right_w = width - m.gap - left_w
+
+    local per_page = ControllerScreen.AGENTS_PER_PAGE
+    local pages = math.max(1, math.ceil(#agents / per_page))
+    local page = math.max(1, math.min(self.agent_page or 1, pages))
     local first = (page - 1) * per_page + 1
-    local last = math.min(#displays, first + per_page - 1)
-    -- 有分頁時每頁都用同樣的格高，翻頁時版面不跳動
-    local slots = pages > 1 and per_page or (last - first + 1)
-    local nav_h = m.footer_h
-    local list_h = height - nav_h - m.gap
-    local item_h = math.floor((list_h - (slots - 1) * m.gap) / slots)
-    local list = VerticalGroup:new{ align = "left" }
-    self.display_buttons = {}
-    for i = first, last do
-        if i > first then table.insert(list, VerticalSpan:new{ width = m.gap }) end
-        local b = self:button(self:displayLabel(displays[i]), list_w, item_h,
-            self:tap(self.on_select_display, i), { font_size = 20, selected = i == self.display_index })
-        self.display_buttons[i] = b
-        table.insert(list, b)
-    end
-    local used_h = (last - first + 1) * item_h + (last - first) * m.gap
-    if used_h < list_h then table.insert(list, VerticalSpan:new{ width = list_h - used_h }) end
-
-    local nav = { { text = "Refresh", callback = self:tap(self.on_refresh) } }
-    if pages > 1 then
-        table.insert(nav, { text = "‹", callback = page > 1 and self:tap(self.on_list_page, -1) or nil })
-        table.insert(nav, { text = string.format("%d / %d", page, pages) })
-        table.insert(nav, { text = "›", callback = page < pages and self:tap(self.on_list_page, 1) or nil })
-    end
-    table.insert(list, VerticalSpan:new{ width = m.gap })
-    table.insert(list, W.buttonRow(nav, list_w, nav_h, self, self.cfg.ui.feedback_ms))
-
-    local current = displays[self.display_index] or displays[1]
-    local label_h = m.header_h
-    local body_h = height - label_h - m.gap
-    local bar_w = math.floor((right_w - m.gap) * 0.5)
-    local key_w = right_w - m.gap - bar_w
-    local key_h = math.floor((body_h - m.gap) / 2)
-    self.brightness_text = W.text(current.brightness and string.format("Brightness: %d%%", current.brightness)
-        or "Brightness: —", 18, true, right_w)
-    self.brightness_label = W.Region:new{
-        LeftContainer:new{ dimen = Geom:new{ w = right_w, h = label_h }, self.brightness_text },
-    }
-    self.brightness_bar = W.SegmentBar:new{
-        width = bar_w,
-        height = body_h,
-        vertical = true,
-        value = toSegments(current.brightness),
-        show_parent = self,
-        on_change = function(idx)
-            self:activity()
-            if self.on_brightness then self.on_brightness(idx * 10) end
-        end,
-    }
-    local function step(delta)
-        return function()
-            self:activity()
-            local level = math.max(10, math.min(100, (current.brightness or 50) + delta))
-            if self.on_brightness then self.on_brightness(level) end
+    local nav_h = pages > 1 and math.floor(m.footer_h * 0.7) or 0
+    local grid_h = main_h - (pages > 1 and (nav_h + m.gap) or 0)
+    local cell_w = math.floor((left_w - m.gap) / 2)
+    local cell_h = math.floor((grid_h - m.gap) / 2)
+    local grid = VerticalGroup:new{ align = "left" }
+    self.agent_cards = {}
+    for row = 0, 1 do
+        if row > 0 then table.insert(grid, VerticalSpan:new{ width = m.gap }) end
+        local line = HorizontalGroup:new{ align = "top" }
+        for col = 0, 1 do
+            local i = first + row * 2 + col
+            local w = col == 0 and cell_w or (left_w - m.gap - cell_w)
+            if col > 0 then table.insert(line, HorizontalSpan:new{ width = m.gap }) end
+            if agents[i] then
+                local card = self:agentCard(agents[i], w, cell_h, i)
+                self.agent_cards[i] = card
+                table.insert(line, card)
+            else
+                table.insert(line, HorizontalSpan:new{ width = w }) -- 空位不畫格子
+            end
         end
+        table.insert(grid, line)
+    end
+    if pages > 1 then
+        table.insert(grid, VerticalSpan:new{ width = m.gap })
+        table.insert(grid, W.buttonRow({
+            { text = "‹", callback = page > 1 and self:tap(self.on_list_page, -1) or nil },
+            { text = string.format("%d / %d", page, pages) },
+            { text = "›", callback = page < pages and self:tap(self.on_list_page, 1) or nil },
+        }, left_w, nav_h, self, self.cfg.ui.feedback_ms))
     end
 
-    return HorizontalGroup:new{
-        align = "top",
-        list,
+    local current = agents[self.agent_index] or agents[1]
+    local function key(text, name)
+        return { text = text, font_size = 16, callback = self:tap(self.on_agent_key, name) }
+    end
+    -- Dictate 比較寬，和 Codex Micro 的長鍵一樣
+    local unit = math.floor((width - 5 * m.gap) / 6.6)
+    local small = {
+        key("Auto", "auto"), key("Approve", "approve"), key("Stop", "stop"), key("Open", "open"),
+    }
+    local keys = HorizontalGroup:new{
+        W.buttonRow(small, 4 * unit + 3 * m.gap, keys_h, self, self.cfg.ui.feedback_ms),
         HorizontalSpan:new{ width = m.gap },
-        VerticalGroup:new{
-            align = "left",
-            self.brightness_label,
-            VerticalSpan:new{ width = m.gap },
-            HorizontalGroup:new{
-                align = "top",
-                self.brightness_bar,
-                HorizontalSpan:new{ width = m.gap },
-                VerticalGroup:new{
-                    self:button("Brighter", key_w, key_h, step(10), { font_size = 18 }),
-                    VerticalSpan:new{ width = m.gap },
-                    self:button("Dimmer", key_w, body_h - m.gap - key_h, step(-10), { font_size = 18 }),
-                },
-            },
+        W.buttonRow({ key("Dictate", "dictate") }, math.floor(unit * 1.6), keys_h, self, self.cfg.ui.feedback_ms),
+        HorizontalSpan:new{ width = m.gap },
+        W.buttonRow({ key("Send", "send") }, width - 4 * unit - 5 * m.gap - math.floor(unit * 1.6), keys_h,
+            self, self.cfg.ui.feedback_ms),
+    }
+
+    return VerticalGroup:new{
+        align = "left",
+        HorizontalGroup:new{
+            align = "top",
+            grid,
+            HorizontalSpan:new{ width = m.gap },
+            self:agentDetail(current, right_w, main_h),
         },
+        VerticalSpan:new{ width = m.gap },
+        keys,
     }
 end
 
@@ -305,8 +349,8 @@ function ControllerScreen:init()
         body = self:buildMessage(m.inner_w, body_h)
     elseif page == "media" then
         body = self:buildMedia(m.inner_w, body_h)
-    elseif page == "monitor" then
-        body = self:buildMonitor(m.inner_w, body_h)
+    elseif page == "agents" then
+        body = self:buildAgents(m.inner_w, body_h)
     else
         body = self:buildHome(m.inner_w, body_h)
     end
@@ -359,18 +403,6 @@ function ControllerScreen:setVolume(level, muted)
     self.volume_bar:setValue(muted and 0 or toSegments(level))
     self.volume_text:setText(self:volumeLabel())
     UIManager:setDirty(self, function() return "ui", self.volume_label.dimen end)
-end
-
---- Monitor 頁：更新目前螢幕的亮度
-function ControllerScreen:setBrightness(level)
-    local d = self.displays and self.displays[self.display_index]
-    if not d or not self.brightness_bar then return end
-    d.brightness = level
-    self.brightness_bar:setValue(toSegments(level))
-    self.brightness_text:setText(string.format("Brightness: %d%%", level))
-    UIManager:setDirty(self, function() return "ui", self.brightness_label.dimen end)
-    local b = self.display_buttons[self.display_index]
-    if b then b:setText(self:displayLabel(d)) end
 end
 
 return ControllerScreen
