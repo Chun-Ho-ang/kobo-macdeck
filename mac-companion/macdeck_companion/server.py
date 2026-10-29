@@ -1,8 +1,14 @@
 """Local HTTP transport (Wi-Fi fallback route)."""
 
 import argparse
+import hmac
+import ipaddress
 import json
 import logging
+import os
+import secrets
+import socket
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,7 +26,40 @@ def load_config(path: Path) -> dict:
     return {}
 
 
-def make_handler(actions: Actions, deduper: Deduper):
+def load_token(path: Path) -> str:
+    """Pairing token shared with the Kobo. Created on first run; never logged."""
+    if path.exists():
+        token = path.read_text().strip()
+        if token:
+            return token
+    token = secrets.token_hex(8)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
+
+
+def lan_address() -> str:
+    """The IPv4 address other devices on this network reach the Mac at (no packet is sent)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+
+
+def check_host(host: str) -> None:
+    """Only loopback or private-network addresses; never all interfaces or a public IP."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise SystemExit(f"--host must be an IP address, got {host!r}")
+    if ip.is_unspecified or not (ip.is_loopback or ip.is_private):
+        raise SystemExit(f"refusing to listen on {host}: use 127.0.0.1 or this Mac's local network address (--lan)")
+
+
+def make_handler(actions: Actions, deduper: Deduper, token: str):
+    expected = f"Bearer {token}".encode()
+
+
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code: int, body: dict):
             data = json.dumps(body).encode()
@@ -33,6 +72,9 @@ def make_handler(actions: Actions, deduper: Deduper):
         def do_POST(self):
             if self.path != "/command":
                 return self._reply(404, {"error": "not found"})
+            if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
+                log.warning("rejected request from %s: bad token", self.client_address[0])
+                return self._reply(401, {"error": "bad token"})
             length = int(self.headers.get("Content-Length", 0))
             if length > MAX_BODY:
                 return self._reply(413, {"error": "too large"})
@@ -41,7 +83,6 @@ def make_handler(actions: Actions, deduper: Deduper):
             except (json.JSONDecodeError, ProtocolError) as e:
                 return self._reply(400, {"error": str(e)})
 
-            # TODO(Phase 3): 驗證配對 token / session、時間窗、重放防護
             cached = deduper.get(msg["id"])
             if cached is not None:
                 return self._reply(200, cached)
@@ -68,16 +109,26 @@ def make_handler(actions: Actions, deduper: Deduper):
 def main():
     p = argparse.ArgumentParser(description="MacDeck Companion")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--lan", action="store_true", help="listen on this Mac's local network address so the Kobo can connect")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--config", type=Path, default=Path("config.json"))
+    p.add_argument("--token-file", type=Path, default=Path("token.txt"))
     p.add_argument("--live", action="store_true", help="actually run actions (default: dry-run)")
     a = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    host = lan_address() if a.lan else a.host
+    check_host(host)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
+    token = load_token(a.token_file)
     actions = Actions(load_config(a.config), dry_run=not a.live)
-    server = ThreadingHTTPServer((a.host, a.port), make_handler(actions, Deduper()))
-    log.info("listening on %s:%d (%s)", a.host, a.port, "live" if a.live else "dry-run")
+    server = ThreadingHTTPServer((host, a.port), make_handler(actions, Deduper(), token))
+    log.info("listening on %s:%d (%s)", host, a.port, "live" if a.live else "dry-run")
+    log.info("Kobo settings: host = \"%s\", port = %d, token = contents of %s", host, a.port, a.token_file.resolve())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    main()
