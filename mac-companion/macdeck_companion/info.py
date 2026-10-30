@@ -4,7 +4,10 @@ Both are read-only and cached, so the Kobo can ask as often as it likes.
 """
 
 import json
+import platform
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -16,6 +19,7 @@ from typing import Callable, Optional
 WEATHER_TTL = 15 * 60
 EVENT_TTL = 2 * 60
 HELPERS = Path(__file__).resolve().parent.parent / "helpers"
+MIN_MACOS = "14.0"  # 和 helpers/Info.plist 的 LSMinimumSystemVersion 一致
 
 # WMO weather codes → short English text (fits the Kobo tile)
 WMO = {
@@ -115,19 +119,44 @@ def when_label(start: float, end: float, now: datetime) -> str:
 
 
 class NextEvent:
-    """Runs helpers/next_event.swift (compiled once). macOS asks for Calendar access the first time."""
+    """Runs helpers/next_event.swift as its own app (MacDeck Calendar.app), so macOS asks for
+    Calendar access in that app's name no matter which terminal started the Companion.
 
-    def __init__(self, run: Optional[Callable[[], str]] = None, clock=time.time, now=datetime.now):
+    Reading happens in the background: the Kobo gets the last result right away and never waits
+    for the first compile or for you to answer the permission prompt.
+    """
+
+    def __init__(self, run: Optional[Callable[[], str]] = None, clock=time.time, now=datetime.now,
+                 background: bool = True):
         self.run = run or self._run_helper
-        self.cache = Cached(EVENT_TTL, clock)
-        self.now = now
+        self.clock, self.now = clock, now
+        self.background = background
+        self.lock = threading.Lock()
+        self.value: dict = {"error": "Reading calendar…"}
+        self.at: Optional[float] = None
+        self.busy = False
 
     def get(self) -> dict:
+        with self.lock:
+            stale = self.at is None or self.clock() - self.at >= EVENT_TTL
+            start = stale and not self.busy
+            if start:
+                self.busy = True
+        if start:
+            if self.background:
+                threading.Thread(target=self._refresh, daemon=True).start()
+            else:
+                self._refresh()
+        with self.lock:
+            return self.value
+
+    def _refresh(self) -> None:
         try:
-            return self.cache.get(self._load)
-        except (OSError, ValueError, subprocess.SubprocessError, InfoError) as e:
-            self.cache.at = None
-            return {"error": str(e) if isinstance(e, InfoError) else f"Calendar unavailable ({type(e).__name__})"}
+            value = self._load()
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, InfoError) as e:
+            value = {"error": str(e) if isinstance(e, InfoError) else f"Calendar unavailable ({type(e).__name__})"}
+        with self.lock:
+            self.value, self.at, self.busy = value, self.clock(), False
 
     def _load(self) -> dict:
         d = json.loads(self.run())
@@ -147,11 +176,23 @@ class NextEvent:
     def _run_helper() -> str:
         src = HELPERS / "next_event.swift"
         plist = HELPERS / "Info.plist"
-        out = HELPERS / ".build" / "next-event"
-        if not out.exists() or out.stat().st_mtime < max(src.stat().st_mtime, plist.stat().st_mtime):
-            out.parent.mkdir(exist_ok=True)
-            # 把 Info.plist 嵌進執行檔，macOS 才會顯示行事曆權限的說明而不是直接拒絕
-            subprocess.run(["swiftc", "-O", str(src), "-o", str(out),
-                            "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
-                            "-Xlinker", str(plist)], check=True, timeout=180, capture_output=True)
-        return subprocess.run([str(out)], check=True, timeout=30, capture_output=True, text=True).stdout
+        app = HELPERS / ".build" / "MacDeck Calendar.app"
+        exe = app / "Contents" / "MacOS" / "next-event"
+        if not exe.exists() or exe.stat().st_mtime < max(src.stat().st_mtime, plist.stat().st_mtime):
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(plist, app / "Contents" / "Info.plist")
+            # 明確指定最低系統版本：swiftc 預設可能跟著 SDK 標成比這台 Mac 還新的版本，LaunchServices 會拒絕啟動（-10825）
+            target = f"{platform.machine()}-apple-macos{MIN_MACOS}"
+            subprocess.run(["swiftc", "-O", "-target", target, str(src), "-o", str(exe)],
+                           check=True, timeout=300, capture_output=True)
+            # 簽成一個完整的 App（ad-hoc），macOS 才會用 bundle id 記住你給的權限
+            subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True, timeout=60,
+                           capture_output=True)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "events.json"
+            # -n 新開一份、-W 等它結束、-g -j 不搶前景也不顯示；第一次會等你回答權限詢問
+            subprocess.run(["open", "-n", "-W", "-g", "-j", str(app), "--args", str(out)],
+                           check=True, timeout=180, capture_output=True)
+            if not out.exists():
+                raise InfoError("Calendar helper didn't answer")
+            return out.read_text()

@@ -8,3 +8,4 @@ mac-companion/config.json
 mac-companion/token.txt
 mac-companion/hook-auth.txt
 mac-companion/helpers/.build/
+mac-companion/app/build/

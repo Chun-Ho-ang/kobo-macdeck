@@ -19,6 +19,26 @@ curl -s -X POST http://127.0.0.1:8765/command -H "Authorization: Bearer $(cat to
 ```
 （用 `--lan` 啟動時，把 `127.0.0.1` 換成印出來的 IP。）
 
+## 選單列 App（建議）
+
+不想每次開終端機的話，用選單列 App 啟動 / 停止 Companion：
+
+```bash
+cd mac-companion/app && ./build.sh --install   # 裝到 ~/Applications/MacDeck.app
+open ~/Applications/MacDeck.app
+```
+
+右上角選單列會出現 MacDeck 圖示（實線 = 執行中，虛線 = 停止）：
+
+- **Start / Stop Companion**：等同 `python3 -m macdeck_companion --lan`
+- **Live mode**：打勾等同加 `--live`；執行中切換會自動重啟
+- **Copy Kobo settings**：把含 host 與 token 的 `macdeck.lua` 內容複製到剪貼簿
+- **Open log**：`~/Library/Logs/MacDeck/companion.log`
+- 關掉 App 時 Companion 一起停；下次開 App 會照上次的狀態（開著就自動啟動）
+- 由 App 啟動時，「控制 Music / System Events」「輔助使用」這些權限會算在 MacDeck 身上，第一次會再問一次
+- 重新 build 之後 macOS 可能會再問一次權限（未簽署開發者憑證的 App 每次 build 都算新版本）
+- 不要同時在終端機也跑一份，會搶同一個埠（App 會顯示「port 8765 in use」）
+
 ## 白名單動作
 
 | Action | 參數 | Mac 端實作 |
@@ -47,8 +67,10 @@ python3 -m macdeck_companion.set_location "Taipei" --unit celsius   # 或 --unit
 
 **下一個行程**（macOS 行事曆，含 iCloud / Google 等已加進「行事曆」App 的帳號，快取 2 分鐘）：
 
-- 由 `helpers/next_event.swift` 透過 EventKit 讀取，第一次使用時自動用 `swiftc` 編譯到 `helpers/.build/`（需要 Xcode Command Line Tools）
-- 第一次會跳出「終端機想要取用你的行事曆」，要按允許；之後可在 系統設定 → 隱私權與安全性 → 行事曆 調整
+- 由 `helpers/next_event.swift` 透過 EventKit 讀取，第一次使用時自動編譯成 `helpers/.build/MacDeck Calendar.app`（需要 Xcode Command Line Tools）
+- 以獨立的 App 啟動，權限算在「MacDeck Calendar」身上；不管 Companion 從 Terminal、VS Code 或其他地方啟動都能正常詢問（從 VS Code 終端機直接讀行事曆，macOS 會靜默拒絕、不跳視窗）
+- 第一次會跳出「MacDeck Calendar 想要取用你的行事曆」，要按允許；之後可在 系統設定 → 隱私權與安全性 → 行事曆 調整
+- 在背景讀取：Kobo 不會等編譯或等你按允許，期間顯示「Reading calendar…」，下一次同步就有資料
 - 顯示 7 天內最近一個行程；全天行程、已取消、你已婉拒的會議不算
 - 標題、時間、地點只傳給 Kobo，不寫 log
 

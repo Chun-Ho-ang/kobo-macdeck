@@ -102,6 +102,18 @@ function MacDeck:createTransport(t)
     }
 end
 
+-- 系統要睡眠：停掉所有計時器與網路（輪詢、同步、逾時），不要在 Wi-Fi 關閉途中還去連 Mac
+-- 喚醒時會收到 resume 事件，回到 Clock 重新開始
+function MacDeck:onSuspend(s)
+    if self.session ~= s then return end
+    self:stopPolling(s)
+    s.idle:cancel()
+    s.connect_timeout:cancel()
+    s.ticker:stop()
+    s.syncing = false
+    pcall(function() s.transport:disconnect() end)
+end
+
 -- 只接受目前 session 的事件，避免舊的 callback 打到新 session
 function MacDeck:fire(s, event, detail)
     if self.session ~= s then return end
@@ -198,7 +210,7 @@ function MacDeck:screenCallbacks(s, extra)
         on_exit = function() self:fire(s, "exit") end,
         on_clock = function() self:fire(s, "clock") end,
         on_closed = function(screen) self:onScreenClosed(s, screen) end,
-        on_suspend = function() s.ticker:stop() end,
+        on_suspend = function() self:onSuspend(s) end,
         on_resume = function() self:fire(s, "resume") end,
     }
     for k, v in pairs(extra or {}) do o[k] = v end

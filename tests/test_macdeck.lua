@@ -335,6 +335,23 @@ test("clock syncs weather / next event from the Mac", function()
     p:teardown(p.session)
 end)
 
+test("suspend stops every timer and network call", function()
+    reset()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Agents"); U:advance(1)
+    local s = p.session
+    assert(s.poll, "polling while on Agents")
+    U:broadcastEvent({ name = "Suspend" })
+    eq(#U.tasks, 0, "nothing scheduled while asleep")
+    eq(s.transport.connected, false)
+    U:advance(600)
+    eq(#U.tasks, 0, "still nothing after 10 minutes")
+    U:broadcastEvent({ name = "Resume" })
+    eq(s.machine.state, "CLOCK", "wakes to the clock")
+    p:teardown(s); eq(#U.tasks, 0)
+end)
+
 test("start twice / keep orientation", function()
     reset()
     Stubs.user_config = { ui = { orientation = "keep" } }
@@ -445,6 +462,22 @@ test("wifi: replies after disconnect are dropped", function()
     t:disconnect(); U:advance(1)
     eq(got, 0); eq(fake.requests, 1, "only the ping went out")
     p:teardown(p.session)
+end)
+
+test("wifi: no socket when Wi-Fi is off", function()
+    reset()
+    local fake = fakeMac()
+    local net = { up = true }
+    function net:isConnected() return self.up end
+    local t = Wifi.new{ ui_manager = U, host = "10.0.0.40", token = "t0k", network = net }
+    local got
+    t:connect(function(ok) got = ok end); U:advance(1)
+    eq(got, true); eq(fake.requests, 1)
+    net.up = false
+    local ack
+    t:send("agents.list", {}, function(a) ack = a end); U:advance(1)
+    eq(ack.detail, "Wi-Fi is off"); eq(ack.offline, true)
+    eq(fake.requests, 1, "no HTTP request while Wi-Fi is down")
 end)
 
 print(string.format("%d passed, %d failed", passed, failed))

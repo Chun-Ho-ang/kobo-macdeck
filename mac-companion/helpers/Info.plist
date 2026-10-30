@@ -3,9 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>local.macdeck.next-event</string>
+    <string>local.macdeck.calendar</string>
     <key>CFBundleName</key>
-    <string>MacDeck next event</string>
+    <string>MacDeck Calendar</string>
+    <key>CFBundleExecutable</key>
+    <string>next-event</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>MacDeck shows your next event on the Kobo clock.</string>
     <key>NSCalendarsUsageDescription</key>

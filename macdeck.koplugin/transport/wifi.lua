@@ -127,6 +127,12 @@ function Wifi:send(action, args, on_ack)
         if not self.connected then
             return on_ack(errorAck(msg.id, "not connected", true))
         end
+        local net = self:_network()
+        if net and not net:isConnected() then
+            -- Wi-Fi 已關（例如正要睡眠）：不開 socket，直接當成離線
+            self.connected = false
+            return on_ack(errorAck(msg.id, "Wi-Fi is off", true))
+        end
         local ack = self:_post(msg)
         if gen ~= self.gen then return end
         if ack.offline then self.connected = false end

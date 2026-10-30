@@ -197,15 +197,42 @@ class ClockInfo(unittest.TestCase):
         self.assertEqual(when_label(at(10, 0, 31), at(11, 0, 31), now), "Sat 10:00–11:00")
 
         out = json.dumps({"events": [{"title": "Design review", "start": at(14), "end": at(15), "location": "Room 3"}]})
-        ev = NextEvent(run=lambda: out, now=lambda: now).get()
+        ev = NextEvent(run=lambda: out, now=lambda: now, background=False).get()
         self.assertEqual(ev["event"], {"title": "Design review", "when": "Today 14:00–15:00", "location": "Room 3"})
-        self.assertEqual(NextEvent(run=lambda: '{"events": []}').get(), {"event": None})
-        denied = NextEvent(run=lambda: '{"error": "Allow Calendar access for Terminal"}').get()
-        self.assertEqual(denied, {"error": "Allow Calendar access for Terminal"})
+        self.assertEqual(NextEvent(run=lambda: '{"events": []}', background=False).get(), {"event": None})
+        denied = NextEvent(run=lambda: '{"error": "Allow Calendar for MacDeck Calendar"}', background=False).get()
+        self.assertEqual(denied, {"error": "Allow Calendar for MacDeck Calendar"})
+
+    def test_next_event_background(self):
+        import threading as th
+        gate, calls, clock = th.Event(), [], [0]
+
+        def slow():
+            calls.append(1)
+            gate.wait(2)
+            return '{"events": []}'
+        ne = NextEvent(run=slow, clock=lambda: clock[0])
+        reading = {"error": "Reading calendar…"}
+        self.assertEqual(ne.get(), reading, "answers at once while reading")
+        self.assertEqual(ne.get(), reading)
+        gate.set()
+        for _ in range(100):
+            if ne.at is not None:
+                break
+            th.Event().wait(0.01)
+        self.assertEqual(ne.get(), {"event": None})
+        self.assertEqual(len(calls), 1, "one read at a time, then cached")
+        clock[0] = 3 * 60
+        ne.get()
+        for _ in range(100):
+            if len(calls) == 2 and not ne.busy:
+                break
+            th.Event().wait(0.01)
+        self.assertEqual(len(calls), 2, "re-read after the cache expires")
 
     def test_info_action(self):
         weather = Weather({}, fetch=None)
-        cal = NextEvent(run=lambda: '{"events": []}')
+        cal = NextEvent(run=lambda: '{"events": []}', background=False)
         detail, data = Actions({}, weather=weather, calendar=cal).execute("info.get", {})
         self.assertEqual(data["weather"], {"error": "Set a location on the Mac"})
         self.assertIsNone(data["event"])

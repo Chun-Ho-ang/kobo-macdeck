@@ -1,11 +1,18 @@
-// 印出接下來 7 天內最近的兩個行程（JSON），給 MacDeck Companion 用
+// 接下來 7 天內最近的兩個行程（JSON），給 MacDeck Companion 用
 // 全天行程、已取消、你已婉拒的會議不算
+// 包成「MacDeck Calendar.app」用 open 啟動：行事曆權限算在這個 App 自己身上，
+// 不管 Companion 是從終端機、VS Code 還是別的地方啟動都能正常詢問
+// 用法：next-event <輸出檔>（沒給就印到 stdout）
 import EventKit
 import Foundation
 
 func emit(_ obj: [String: Any]) {
     let data = try! JSONSerialization.data(withJSONObject: obj)
-    print(String(data: data, encoding: .utf8)!)
+    if CommandLine.arguments.count > 1 {
+        try? data.write(to: URL(fileURLWithPath: CommandLine.arguments[1]), options: .atomic)
+    } else {
+        print(String(data: data, encoding: .utf8)!)
+    }
 }
 
 let store = EKEventStore()
@@ -18,7 +25,7 @@ if #available(macOS 14.0, *) {
 }
 done.wait()
 guard granted else {
-    emit(["error": "Allow Calendar access for Terminal"])
+    emit(["error": "Allow Calendar for MacDeck Calendar"])
     exit(0)
 }
 
