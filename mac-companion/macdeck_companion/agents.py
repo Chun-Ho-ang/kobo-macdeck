@@ -1,4 +1,7 @@
-"""Claude Code session status, fed by Claude Code hooks (POST /hook).
+"""Agent session status for the Kobo's Agents page.
+
+Sources: Claude Code hooks (POST /hook), Codex session files and ChatGPT / Claude app presence
+(see sources.py), all normalised into the same Session.
 
 Only what the Kobo needs to draw a slot is kept. Prompts and commands are shown
 on the Kobo but never logged.
@@ -73,8 +76,9 @@ def describe_tool(name: str, tool_input: dict) -> Optional[str]:
 
 
 class Session:
-    def __init__(self, sid: str, now: float):
+    def __init__(self, sid: str, now: float, source: str = "Claude Code"):
         self.id = sid
+        self.source = source
         self.project = ""
         self.title = ""
         self.state = "idle"
@@ -194,6 +198,36 @@ class AgentHub:
         elif tool == "TaskUpdate":
             self._set_task(s, tool_input.get("taskId"), tool_input.get("status"))
 
+    # ── other sources (Codex, app presence) ──
+
+    def apply(self, sid: str, source: str, at: Optional[float] = None, *, new_turn: bool = False,
+              **fields) -> None:
+        """Upsert a session from a non-hook source. fields: project, title, state, summary, step, prompt, app."""
+        if not SESSION_ID.match(sid):
+            return
+        now = self._clock()
+        at = now if at is None else at
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is None:
+                s = self._sessions[sid] = Session(sid, at, source)
+            s.source = source
+            s.updated = max(s.updated, at)
+            if new_turn:
+                s.started, s.step = at, ""
+            for key in ("project", "title", "summary", "step", "prompt"):
+                if fields.get(key) is not None:
+                    setattr(s, key, _clip(fields[key], 80 if key == "prompt" else 60))
+            if fields.get("state") in STATES:
+                s.state = fields["state"]
+            if fields.get("app") and BUNDLE_ID.match(fields["app"]):
+                s.app = fields["app"]
+            self._expire(now)
+
+    def remove(self, sid: str) -> None:
+        with self._lock:
+            self._sessions.pop(sid, None)
+
     def _expire(self, now: float) -> None:
         for sid in [k for k, s in self._sessions.items() if now - s.updated > EXPIRE_SEC]:
             del self._sessions[sid]
@@ -209,13 +243,15 @@ class AgentHub:
             for s in sessions[:MAX_SESSIONS]:
                 done = sum(t["status"] == "completed" for t in s.tasks)
                 summary = s.summary
-                if s.state in ("done", "idle"):
+                if s.state == "done" or (s.state == "idle" and s.source == "Claude Code"):
                     summary = _ago(now - s.updated)
                 out.append({
                     "id": s.id,
+                    "source": s.source,
                     "project": s.title or s.project or "session",
                     "state": s.state,
-                    "label": LABELS[s.state],
+                    "label": ("Open" if s.state == "idle" else "Answering" if s.state == "working" else LABELS[s.state])
+                    if s.source in ("ChatGPT", "Claude") else LABELS[s.state],
                     "summary": summary,
                     "progress": f"{done}/{len(s.tasks)}" if s.tasks else "",
                     "elapsed": _duration((s.updated if s.state != "working" else now) - s.started),
@@ -229,6 +265,11 @@ class AgentHub:
         with self._lock:
             s = self._sessions.get(sid)
             return s.app if s else None
+
+    def state_of(self, sid: str) -> Optional[str]:
+        with self._lock:
+            s = self._sessions.get(sid)
+            return s.state if s else None
 
     def exists(self, sid: str) -> bool:
         with self._lock:

@@ -38,8 +38,13 @@ end
 
 -- ── Session ──────────────────────────────────────────────
 
+-- 診斷紀錄：debug 等級，平常不寫進 crash.log；要查問題時到
+-- KOReader 選單 → 工具 → 更多工具 → 開發者選項 開啟 debug logging，最後一行就是 MacDeck 最後在做的事
+local function trace(...) logger.dbg("MacDeck:", ...) end
+
 function MacDeck:start()
     if self.session then return end
+    trace("start")
     local cfg = Settings.load()
     local s = {
         cfg = cfg,
@@ -47,6 +52,7 @@ function MacDeck:start()
         minutes = 0,
         page = "home",
         media = nil,
+        now_playing = nil, -- Media 頁最上面那一行（Mac 回報的正在播放）
         info = nil, -- 時鐘右側的天氣 / 行程（Mac 同步來的）
         last_sync = nil, -- 上次嘗試同步的時間（Scheduler.now）
         syncing = false,
@@ -54,11 +60,12 @@ function MacDeck:start()
         agent_index = 1,
         agent_id = nil, -- 以 id 記住選的 session，清單重新排序也不會選錯
         agent_page = 1,
+        agent_filter = nil, -- nil = 全部；否則只看這個來源（"Claude Code"、"Codex"…）
     }
     self.session = s
 
     s.transport = self:createTransport(cfg.transport)
-    s.ticker = Scheduler.minuteTicker{ ui_manager = UIManager, on_tick = function() self:onMinute(s) end }
+    s.ticker = Scheduler.minuteTicker{ ui_manager = UIManager, on_tick = function() self:tickMinute(s) end }
     s.idle = Scheduler.timeout(UIManager, cfg.idle.controller_timeout_sec, function()
         if s.page == "agents" and cfg.agents.stay_open and s.machine.state == S.CONTROL then
             return s.idle:reset() -- Agents 頁當狀態板用，不跳回時鐘
@@ -104,8 +111,11 @@ end
 
 -- 系統要睡眠：停掉所有計時器與網路（輪詢、同步、逾時），不要在 Wi-Fi 關閉途中還去連 Mac
 -- 喚醒時會收到 resume 事件，回到 Clock 重新開始
-function MacDeck:onSuspend(s)
+-- 注意：外掛上名字是 on + 大寫開頭的方法，KOReader 會當成事件處理器直接呼叫（不會帶 s），
+-- 所以這裡和 tickMinute / screenClosed 都刻意不用 on 開頭；只有 onCloseWidget 是真的要接事件
+function MacDeck:suspendSession(s)
     if self.session ~= s then return end
+    trace("suspend: stopping timers and network")
     self:stopPolling(s)
     s.idle:cancel()
     s.connect_timeout:cancel()
@@ -121,7 +131,18 @@ function MacDeck:fire(s, event, detail)
     s.machine:fire(event)
 end
 
+-- 安全網：同一秒內切換狀態太多次一定是迴圈，直接退出，不讓整台機器卡死
+local MAX_ENTERS_PER_SEC = 50
+
 function MacDeck:enter(s, state)
+    trace("state", state)
+    local now = Scheduler.now()
+    if s.burst_at ~= now then s.burst_at, s.burst = now, 0 end
+    s.burst = s.burst + 1
+    if s.burst > MAX_ENTERS_PER_SEC and state ~= S.EXITED then
+        logger.err("MacDeck: state loop detected, exiting to KOReader")
+        return self:teardown(s)
+    end
     self:stopPolling(s)
     s.syncing = false -- 同步做到一半被換狀態：那次結果會被 transport 丟掉
     s.idle:cancel()
@@ -175,6 +196,7 @@ end
 
 function MacDeck:syncInfo(s)
     if self.session ~= s or s.machine.state ~= S.CLOCK or not self:syncDue(s) then return end
+    trace("clock sync")
     s.syncing, s.last_sync = true, Scheduler.now()
     local function finish(info)
         if self.session ~= s or s.machine.state ~= S.CLOCK or not s.syncing then return end
@@ -209,9 +231,21 @@ function MacDeck:screenCallbacks(s, extra)
         cfg = s.cfg,
         on_exit = function() self:fire(s, "exit") end,
         on_clock = function() self:fire(s, "clock") end,
-        on_closed = function(screen) self:onScreenClosed(s, screen) end,
-        on_suspend = function() self:onSuspend(s) end,
-        on_resume = function() self:fire(s, "resume") end,
+        on_closed = function(screen) self:screenClosed(s, screen) end,
+        on_suspend = function(screen)
+            if s.screen == screen then self:suspendSession(s) end
+        end,
+        -- KOReader 廣播 Resume 時，途中新 show 的畫面也會收到同一個事件；
+        -- 直接在這裡換畫面會讓新畫面再收到 Resume → 無限迴圈卡死整台機器。
+        -- 所以只讓目前的畫面處理，而且延到廣播結束後、同一次喚醒只處理一次
+        on_resume = function(screen)
+            if s.screen ~= screen or s.resume_tick then return end
+            s.resume_tick = function()
+                s.resume_tick = nil
+                self:fire(s, "resume")
+            end
+            UIManager:nextTick(s.resume_tick)
+        end,
     }
     for k, v in pairs(extra or {}) do o[k] = v end
     return o
@@ -222,9 +256,13 @@ function MacDeck:controller(s, mode)
         mode = mode,
         page = s.page,
         media = s.media,
-        agents = s.agents,
+        now_playing = s.now_playing,
+        agents = s.agents and self:visibleAgents(s),
         agent_index = s.agent_index,
         agent_page = s.agent_page,
+        agent_sources = s.agents and self:agentSources(s),
+        agent_filter = s.agent_filter,
+        dictating = s.dictating,
         message = mode == "OFFLINE" and s.last_detail or nil,
         on_activity = function()
             if s.machine.state == S.CONTROL or s.machine.state == S.OFFLINE then s.idle:reset() end
@@ -233,10 +271,11 @@ function MacDeck:controller(s, mode)
         on_page = function(page) self:openPage(s, page) end,
         on_command = function(action, args, label) self:sendCommand(s, action, args, label, function(data)
             if data and data.level ~= nil then self:applyVolume(s, data) end
+            if action:match("^media%.") then self:pollMedia(s, 1) end -- 換歌要一點時間，1 秒後再讀
         end) end,
         on_volume = function(level) self:setVolume(s, level) end,
         on_select_agent = function(i)
-            local a = s.agents and s.agents[i]
+            local a = s.agents and self:visibleAgents(s)[i]
             if not a then return end
             s.agent_index, s.agent_id = i, a.id
             self:showScreen(s, self:controller(s, S.CONTROL))
@@ -246,20 +285,46 @@ function MacDeck:controller(s, mode)
             self:showScreen(s, self:controller(s, S.CONTROL))
         end,
         on_agent_key = function(key) self:agentKey(s, key) end,
+        on_agent_filter = function(source)
+            s.agent_filter = source
+            self:selectAgent(s)
+            self:showScreen(s, self:controller(s, S.CONTROL))
+        end,
     }))
 end
 
 -- Controller 內換頁（仍在 CONTROL 狀態）；進頁時向 Mac 讀目前狀態
 function MacDeck:openPage(s, page)
     if self.session ~= s or s.machine.state ~= S.CONTROL then return end
+    trace("page", page)
     self:stopPolling(s)
     s.page = page
     self:showScreen(s, self:controller(s, S.CONTROL))
     if page == "media" then
         self:sendCommand(s, "volume.get", {}, nil, function(data) self:applyVolume(s, data) end)
+        self:pollMedia(s)
     elseif page == "agents" then
         self:pollAgents(s)
     end
+end
+
+-- ── Media：正在播放 ──────────────────────────────────────
+
+--- delay 秒後讀一次（nil = 現在），之後每 media.poll_sec 秒；只在 Media 頁
+function MacDeck:pollMedia(s, delay)
+    if s.media_poll then UIManager:unschedule(s.media_poll); s.media_poll = nil end
+    if self.session ~= s or s.page ~= "media" or s.machine.state ~= S.CONTROL then return end
+    s.media_poll = function()
+        s.media_poll = nil
+        if self.session ~= s or s.page ~= "media" or s.machine.state ~= S.CONTROL then return end
+        self:sendCommand(s, "media.now", {}, nil, function(data)
+            if type(data) ~= "table" or s.page ~= "media" then return end
+            s.now_playing = data
+            if s.screen then s.screen:setNowPlaying(data) end
+        end)
+        self:pollMedia(s, s.cfg.media.poll_sec)
+    end
+    UIManager:scheduleIn(delay or 0, s.media_poll)
 end
 
 -- ── Agents ───────────────────────────────────────────────
@@ -279,6 +344,14 @@ function MacDeck:pollAgents(s)
 end
 
 function MacDeck:stopPolling(s)
+    if s.media_poll then
+        UIManager:unschedule(s.media_poll)
+        s.media_poll = nil
+    end
+    if s.resume_tick then
+        UIManager:unschedule(s.resume_tick)
+        s.resume_tick = nil
+    end
     if s.sync_tick then
         UIManager:unschedule(s.sync_tick)
         s.sync_tick = nil
@@ -310,13 +383,46 @@ function MacDeck:applyAgents(s, agents)
     local sig = signature(agents)
     if s.agents and sig == s.agents_sig then return end -- elapsed 每次都會變，不算
     s.agents, s.agents_sig = agents, sig
+    self:selectAgent(s)
+    self:redrawWhenIdle(s)
+end
+
+--- 依來源篩選後的清單（選單選「全部」時就是整份）
+function MacDeck:visibleAgents(s)
+    if not s.agent_filter then return s.agents or {} end
+    local out = {}
+    for _, a in ipairs(s.agents or {}) do
+        if a.source == s.agent_filter then out[#out + 1] = a end
+    end
+    return out
+end
+
+--- 目前有哪些來源、各幾個，照第一次出現的順序（Mac 端已經把需要你處理的排前面）
+function MacDeck:agentSources(s)
+    local list, index = {}, {}
+    for _, a in ipairs(s.agents or {}) do
+        local name = a.source or "Other"
+        if not index[name] then
+            list[#list + 1] = { name = name, count = 0 }
+            index[name] = list[#list]
+        end
+        index[name].count = index[name].count + 1
+    end
+    return list
+end
+
+--- 在目前看得到的清單裡找回原本選的那個（找不到就選第一個），並翻到它所在的頁
+function MacDeck:selectAgent(s)
+    if s.agent_filter and #self:visibleAgents(s) == 0 then
+        s.agent_filter = nil -- 那個來源已經沒有 session 了，回到全部
+    end
+    local visible = self:visibleAgents(s)
     s.agent_index = 1
-    for i, a in ipairs(agents) do
+    for i, a in ipairs(visible) do
         if a.id == s.agent_id then s.agent_index = i end
     end
-    s.agent_id = agents[s.agent_index] and agents[s.agent_index].id or nil
+    s.agent_id = visible[s.agent_index] and visible[s.agent_index].id or nil
     s.agent_page = math.floor((s.agent_index - 1) / ControllerScreen.AGENTS_PER_PAGE) + 1
-    self:redrawWhenIdle(s)
 end
 
 -- 有按鈕正在回饋時先不換畫面，不然那次點擊會被丟掉
@@ -334,12 +440,17 @@ end
 local KEY_LABELS = { approve = "Approve", stop = "Stop", send = "Send", auto = "Auto", dictate = "Dictate", open = "Open" }
 
 function MacDeck:agentKey(s, key)
-    local a = s.agents and s.agents[s.agent_index]
+    local a = s.agents and self:visibleAgents(s)[s.agent_index]
     if not a then return end
     local label = string.format("%s → %s", KEY_LABELS[key] or key, a.project or "session")
     local action, args = "agent.key", { session_id = a.id, key = key }
     if key == "open" then action, args = "agent.open", { session_id = a.id } end
-    self:sendCommand(s, action, args, label, function()
+    self:sendCommand(s, action, args, label, function(data)
+        if key == "dictate" and type(data) == "table" and data.dictating ~= nil then
+            -- 聽寫是開 / 關切換：按鍵上的字跟著 Mac 實際的狀態變
+            s.dictating = data.dictating
+            self:redrawWhenIdle(s)
+        end
         if key ~= "open" then self:pollAgents(s) end -- 按完馬上更新狀態
     end)
 end
@@ -376,7 +487,7 @@ function MacDeck:sendCommand(s, action, args, label, on_ok)
     end)
 end
 
-function MacDeck:onMinute(s)
+function MacDeck:tickMinute(s)
     if self.session ~= s or s.machine.state ~= S.CLOCK then return end
     s.minutes = s.minutes + 1
     local every = s.cfg.clock.full_refresh_min
@@ -389,6 +500,7 @@ end
 
 -- 先 show 新畫面再 close 舊的，中間不會露出 KOReader
 function MacDeck:showScreen(s, screen)
+    trace("show", screen.name, screen.page or "")
     local old = s.screen
     s.screen = screen
     UIManager:show(screen, "ui")
@@ -399,15 +511,17 @@ function MacDeck:showScreen(s, screen)
 end
 
 -- 畫面被別的方式關掉（不是我們換頁或退出）時，也要完整清理
-function MacDeck:onScreenClosed(s, screen)
+function MacDeck:screenClosed(s, screen)
     if screen._replaced or self.session ~= s then return end
     if s.screen == screen then s.screen = nil end
     self:teardown(s)
 end
 
 -- 可重複呼叫；任何路徑退出都走這裡（T-09）
-function MacDeck:teardown(s)
+-- closing = true：KOReader 自己正在關閉這個 UI，不要再廣播事件給正在拆掉的閱讀器
+function MacDeck:teardown(s, closing)
     if self.session ~= s then return end
+    trace("teardown", closing and "(KOReader closing)" or "")
     self.session = nil
     self:stopPolling(s)
     s.idle:cancel()
@@ -416,10 +530,16 @@ function MacDeck:teardown(s)
     pcall(function() s.transport:disconnect() end)
     if s.screen then
         s.screen._replaced = true
-        UIManager:close(s.screen, "full")
+        UIManager:close(s.screen, closing and "ui" or "full")
         s.screen = nil
     end
-    self:setRotation(s.saved.rotation)
+    if closing then
+        -- 直接把方向設回去，不廣播 SetRotationMode（閱讀器的 document 可能已經不在了）
+        local mode = s.saved.rotation
+        if mode ~= nil and mode ~= Screen:getRotationMode() then pcall(Screen.setRotationMode, Screen, mode) end
+    else
+        self:setRotation(s.saved.rotation)
+    end
 end
 
 -- ── Rotation ─────────────────────────────────────────────
@@ -437,7 +557,7 @@ end
 
 -- KOReader 正在關閉這個 UI（例如從檔案管理器切到閱讀器）
 function MacDeck:onCloseWidget()
-    if self.session then self:teardown(self.session) end
+    if self.session then self:teardown(self.session, true) end
 end
 
 return MacDeck

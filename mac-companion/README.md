@@ -44,11 +44,12 @@ open ~/Applications/MacDeck.app
 | Action | 參數 | Mac 端實作 |
 |---|---|---|
 | `media.previous` / `media.toggle` / `media.next` | — | AppleScript 控制 `media_player`（Music / Spotify） |
+| `media.now` | — | 正在播放 `{player, state, title, artist, album, position, duration}`；唯讀，播放器沒開時不會打開它 |
 | `volume.get` | — | 回傳 `{level, muted}` |
 | `volume.set` | `level` 0–100 | `set volume output volume` |
 | `audio.mute` | — | 切換靜音，回傳 `{level, muted}` |
 | `info.get` | — | 時鐘用：`{weather, event, event_error, synced}`（只讀，見下方） |
-| `agents.list` | — | 回傳 `{sessions: [...]}`，資料來自 Claude Code hooks |
+| `agents.list` | — | 回傳 `{sessions: [...]}` |
 | `agent.key` | `session_id`、`key`：`approve` / `stop` / `send` / `auto` / `dictate` | 先把該 session 的 App 叫到前景，再送固定按鍵 |
 | `agent.open` | `session_id` | 把該 session 的 App 叫到前景 |
 
@@ -74,9 +75,24 @@ python3 -m macdeck_companion.set_location "Taipei" --unit celsius   # 或 --unit
 - 顯示 7 天內最近一個行程；全天行程、已取消、你已婉拒的會議不算
 - 標題、時間、地點只傳給 Kobo，不寫 log
 
-## Agents（Claude Code 狀態板）
+## Agents（狀態板）
 
-Kobo 的 Agents 頁顯示 Mac 上每個 Claude Code session 在做什麼。資料由 Claude Code 的 hooks 推給 Companion：
+Kobo 的 Agents 頁顯示 Mac 上各個 agent 在做什麼。每格第二行標出來源：
+
+| 來源 | 資料怎麼來 | Kobo 上看得到 |
+|---|---|---|
+| **Claude Code**（CLI、Claude 桌面版的 Code 分頁） | Claude Code hooks（下面安裝） | 狀態、任務清單、目前動作、等你核准 |
+| **Codex**（ChatGPT App 裡的 Codex） | 讀 `~/.codex/sessions/` 裡 Codex 自己寫的 session 檔，**不改 Codex 設定** | 狀態、目前動作（指令 / 改檔 / 工具）、等你回覆、錯誤原因（例如用量上限）；Codex 沒有任務清單 |
+| **ChatGPT / Claude App 一般聊天** | `lsappinfo` 看 App 是否開著；再由 `helpers/.build/MacDeck Windows.app` 透過輔助使用讀視窗（只讀） | 對話名稱、是否正在回答（畫面上有 Stop 鈕）、Open / In front；看不到對話內容和進度 |
+
+- ChatGPT / Claude 要讀到對話名稱和「正在回答」，需要在 系統設定 → 隱私權與安全性 → 輔助使用 打開 **MacDeck Windows**（第一次會自動跳出詢問）。沒開時格子仍在，第三行會提示。這部分靠讀 App 畫面結構，App 改版後可能要調整；工具改版重新編譯後也要再開一次權限
+- Codex 只看 12 小時內有動靜的 session；Codex 和 ChatGPT 是同一個 App（`com.openai.codex`），Open / 按鍵都送到 ChatGPT.app
+- 不想要某個來源：`config.json` 加 `"sources": {"codex": false}` 或 `{"apps": false}`
+- prompt、指令內容只在記憶體、只傳給 Kobo，不寫 log
+
+### Claude Code hooks
+
+資料由 Claude Code 的 hooks 推給 Companion：
 
 1. 先啟動 Companion 一次（會產生 `token.txt` 和 `hook-auth.txt`）
 2. 安裝 hooks（先看會改什麼，再寫入；會備份成 `settings.json.bak`）：
@@ -104,13 +120,12 @@ Kobo 的 Agents 頁顯示 Mac 上每個 Claude Code session 在做什麼。資�
 | Stop | Escape |
 | Auto | Shift+Tab（切換權限模式） |
 | Open | 只把 App 叫到前景 |
-| Dictate | `config.json` 的 `dictation_key` |
+| Dictate | 第一下：點 App「編輯」選單的「開始聽寫…」；第二下（60 秒內）：Esc 停止 |
 
 - 按鍵送到該 session 所在的 App（終端機或 Claude 桌面版）的**最前面視窗**；同一個 App 開了好幾個 session 時，請確認前景視窗是對的
 - 第一次送按鍵時 macOS 會要求「輔助使用」權限（系統設定 → 隱私權與安全性 → 輔助使用），允許執行 Companion 的終端機
 - `--live` 才會真的送；dry-run 只回 OK
-- **Dictate**：Kobo 沒有麥克風，用 Mac 的聽寫。到 系統設定 → 鍵盤 → 聽寫 → 快速鍵 → 自訂，設一組按鍵（例如 ⌃⌥D），再寫進 `config.json`：
-
-  ```json
-  { "dictation_key": { "key": "d", "modifiers": ["control", "option"] } }
-  ```
+- **Dictate**：Kobo 沒有麥克風，用 Mac 的聽寫，不用改鍵盤設定
+  - 第一下點前景 App「編輯 → 開始聽寫…」（macOS 聽寫中這個選單不會變成「停止」）
+  - 第二下送 Esc 停止；只在 MacDeck 60 秒內開的聽寫才送，而且那個 session 正在工作時不送（避免 Esc 中斷 Claude 的回答，Kobo 會提示到 Mac 上停）
+  - 想改用自己的聽寫快速鍵：`config.json` 加 `"dictation_key": {"key": "d", "modifiers": ["control", "option"]}`（要先在 系統設定 → 鍵盤 → 聽寫 設同一組）

@@ -1,10 +1,12 @@
 """python3 -m unittest discover -s tests  （在 kobo-macdeck 目錄下）"""
 
 import json
+import os
 import pathlib
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -17,6 +19,7 @@ from macdeck_companion.protocol import Deduper, ProtocolError, ack, parse_comman
 from macdeck_companion.agents import AgentHub, describe_tool  # noqa: E402
 from macdeck_companion.info import NextEvent, Weather, geocode, when_label  # noqa: E402
 from macdeck_companion.install_hooks import SCRIPT, merged  # noqa: E402
+from macdeck_companion.sources import AppPresence, CodexWatcher, describe_item  # noqa: E402
 from macdeck_companion.server import check_host, load_token, make_handler  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -59,6 +62,21 @@ class DryRunActions(unittest.TestCase):
         self.assertTrue(self.a.execute("audio.mute", {})[1]["muted"])
         with self.assertRaises(ActionError):
             self.a.execute("volume.set", {"level": "50; rm -rf ~"})
+
+    def test_media_now(self):
+        a = Actions({}, dry_run=True)
+        a._read = lambda script: "playing\x1f不該 (with 張惠妹)\x1fJay Chou\x1f周杰倫的床邊故事\x1f177,4\x1f291.2\n"
+        detail, data = a.execute("media.now", {})
+        self.assertEqual(data, {"player": "Music", "state": "playing", "title": "不該 (with 張惠妹)",
+                                "artist": "Jay Chou", "album": "周杰倫的床邊故事", "position": 177, "duration": 291})
+        for out, state in (("closed\n", "closed"), ("stopped\n", "stopped"), ("weird", "stopped")):
+            a._read = lambda script, out=out: out
+            self.assertEqual(a.execute("media.now", {})[1], {"player": "Music", "state": state})
+        sp = Actions({"media_player": "Spotify"})
+        scripts = []
+        sp._read = lambda script: scripts.append(script) or "paused\x1fSong\x1fArtist\x1fAlbum\x1f12\x1f200000"
+        self.assertEqual(sp.execute("media.now", {})[1]["duration"], 200, "Spotify reports milliseconds")
+        self.assertIn('if application "Spotify" is running', scripts[0], "never launches the player")
 
     def test_whitelist(self):
         for action in ("mac.lock", "app.activate", "rm -rf", "display.list", "display.brightness.set"):
@@ -147,10 +165,81 @@ class Agents(unittest.TestCase):
                     {"session_id": "s1", "key": "q"}):
             with self.assertRaises(ActionError):
                 a.execute("agent.key", bad)
-        with self.assertRaises(ActionError):
-            Actions({}, hub=self.hub).execute("agent.key", {"session_id": "s1", "key": "dictate"})
         for bad in ({"key": "d;", "modifiers": ["control"]}, {"key": "d", "modifiers": ["hyper"]}, {"key": "d"}):
             self.assertIsNone(Actions({"dictation_key": bad}).dictation)
+
+    def test_keys_press_buttons_first(self):
+        hub = self.hub
+        hub.handle({"session_id": "desk", "cwd": "/p/a", "hook_event_name": "UserPromptSubmit", "prompt": "x"},
+                   app="com.anthropic.claudefordesktop")
+        hook(hub, "UserPromptSubmit", sid="term", prompt="y")  # Terminal
+        a = Actions({}, dry_run=False, hub=hub)
+        pressed, keys, runs = [], [], []
+        found = {"approve": "Allow", "stop": "Stop", "dictate": "Start Dictation…"}
+
+        def press(bundle, names):
+            pressed.append((bundle, names[0]))
+            key = next(k for k, v in __import__("macdeck_companion.actions", fromlist=["BUTTONS"]).BUTTONS.items()
+                       if v == names)
+            return found.get(key)
+        a.press = press
+        a._osascript = lambda script: keys.append(script)
+        a._run = lambda argv: runs.append(argv) or ""
+
+        # Claude 桌面版：按按鈕，不送按鍵
+        self.assertEqual(a.execute("agent.key", {"session_id": "desk", "key": "approve"})[0], "approve: Allow")
+        self.assertEqual(a.execute("agent.key", {"session_id": "desk", "key": "stop"})[0], "stop: Stop")
+        self.assertEqual(keys, [])
+        self.assertEqual(runs[0], ["open", "-b", "com.anthropic.claudefordesktop"], "brought to front first")
+        # 找不到按鈕（例如 Send）→ 改送按鍵
+        a.execute("agent.key", {"session_id": "desk", "key": "send"})
+        self.assertEqual(keys[-1], 'tell application "System Events" to key code 36')
+        # Auto 沒有按鈕名單 → 送 Shift+Tab
+        a.execute("agent.key", {"session_id": "desk", "key": "auto"})
+        self.assertIn("key code 48 using shift down", keys[-1])
+        # 終端機：直接送按鍵，不找按鈕
+        n = len(pressed)
+        a.execute("agent.key", {"session_id": "term", "key": "approve"})
+        self.assertEqual(len(pressed), n, "terminals don't need the button reader")
+        # 聽寫：第一下點「開始聽寫…」選單，第二下送 Esc（60 秒內、而且 session 沒在工作）
+        detail, data = a.execute("agent.key", {"session_id": "term", "key": "dictate"})
+        self.assertEqual((detail, data), ("dictate: Start Dictation…", {"dictating": True}))
+        self.assertEqual(pressed[-1], ("com.apple.Terminal", "Start Dictation"))
+        hook(hub, "Stop", sid="term")  # session 沒在工作
+        n_keys = len(keys)
+        self.assertEqual(a.execute("agent.key", {"session_id": "term", "key": "dictate"}),
+                         ("dictate: stop (Esc)", {"dictating": False}))
+        self.assertEqual(keys[-1], 'tell application "System Events" to key code 53')
+        self.assertEqual(len(keys), n_keys + 1)
+        # 開了之後 session 在工作 → 不送 Esc（避免中斷回答）
+        a.execute("agent.key", {"session_id": "term", "key": "dictate"})
+        hook(hub, "UserPromptSubmit", sid="term", prompt="z")
+        n_keys = len(keys)
+        with self.assertRaises(ActionError):
+            a.execute("agent.key", {"session_id": "term", "key": "dictate"})
+        self.assertEqual(len(keys), n_keys, "no Esc while the agent is working")
+        # 超過 60 秒：macOS 早就自己停了 → 這一下是重新開始
+        a.execute("agent.key", {"session_id": "term", "key": "dictate"})
+        a.dictating_since -= 120
+        self.assertEqual(a.execute("agent.key", {"session_id": "term", "key": "dictate"})[1], {"dictating": True})
+        a.dictating_since = None
+        found.pop("dictate")
+        with self.assertRaises(ActionError):
+            a.execute("agent.key", {"session_id": "desk", "key": "dictate"})
+        # 有自訂快速鍵就用快速鍵
+        b = Actions({"dictation_key": {"key": "d", "modifiers": ["control", "option"]}}, dry_run=False, hub=hub)
+        b.press, b._run = press, (lambda argv: "")
+        sent = []
+        b._osascript = lambda script: sent.append(script)
+        self.assertEqual(b.execute("agent.key", {"session_id": "desk", "key": "dictate"}),
+                         ("dictate: start", {"dictating": True}))
+        self.assertIn('keystroke "d" using {control down, option down}', sent[-1])
+        self.assertEqual(b.execute("agent.key", {"session_id": "desk", "key": "dictate"}),
+                         ("dictate: stop", {"dictating": False}), "same shortcut again stops")
+        self.assertEqual(len(sent), 2)
+        b.execute("agent.key", {"session_id": "desk", "key": "dictate"})
+        b.dictating_since -= 120  # macOS 早就自己停了
+        self.assertEqual(b.execute("agent.key", {"session_id": "desk", "key": "dictate"})[1], {"dictating": True})
 
     def test_install_hooks(self):
         mine = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}, "model": "opus"}
@@ -163,6 +252,126 @@ class Agents(unittest.TestCase):
         self.assertTrue(SCRIPT.exists())
 
 
+class OtherSources(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        from datetime import datetime
+        self.now = datetime(2026, 10, 29, 20, 0).timestamp()
+        day = self.root / "sessions" / "2026" / "10" / "29"
+        day.mkdir(parents=True)
+        self.file = day / "rollout-2026-10-29T19-50-00-abc.jsonl"
+        (self.root / "session_index.jsonl").write_text(json.dumps({"id": "t-1", "thread_name": "Fix login", "updated_at": "x"}) + "\n")
+        self.hub = AgentHub(clock=lambda: self.now)
+        self.w = CodexWatcher(self.hub, root=self.root, clock=lambda: self.now)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, *events, partial=b""):
+        with open(self.file, "ab") as f:
+            for e in events:
+                f.write(json.dumps(dict(timestamp="2026-10-29T23:58:00Z", **e)).encode() + b"\n")
+            f.write(partial)
+
+    def one(self):
+        return self.hub.snapshot()[0]
+
+    def test_codex_lifecycle(self):
+        self.write({"type": "session_meta", "payload": {"id": "t-1", "cwd": "/Users/me/api"}},
+                   {"type": "event_msg", "payload": {"type": "task_started"}},
+                   {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                       "type": "UserMessage", "content": [{"type": "input_text", "text": "Fix the login test"}]}}},
+                   {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                       "type": "CommandExecution", "command": ["/bin/zsh", "-lc", "npm test"]}}})
+        self.w.poll()
+        s = self.one()
+        self.assertEqual((s["source"], s["project"], s["state"], s["summary"], s["prompt"]),
+                         ("Codex", "Fix login", "working", "Run: npm test", "Fix the login test"))
+        # 只寫了一半的行留到下次
+        self.write({"type": "response_item", "payload": {"type": "custom_tool_call", "name": "request_user_input_async",
+                                                         "call_id": "c1"}}, partial=b'{"type": "event_')
+        self.w.poll()
+        self.assertEqual((self.one()["state"], self.one()["label"]), ("waiting", "Needs you"))
+        with open(self.file, "ab") as f:
+            f.write(b'msg", "payload": {"type": "turn_aborted"}}\n')
+        self.write({"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c1"}})
+        self.w.poll()
+        self.assertEqual(self.one()["state"], "working", "answered, and the half line was read later")
+        self.write({"type": "event_msg", "payload": {"type": "task_complete", "error": {"message": "Usage limit"}}})
+        self.w.poll()
+        self.assertEqual((self.one()["state"], self.one()["summary"]), ("error", "Usage limit"))
+        self.write({"type": "event_msg", "payload": {"type": "task_started"}},
+                   {"type": "event_msg", "payload": {"type": "task_complete", "error": None}})
+        self.w.poll()
+        self.assertEqual(self.one()["state"], "done")
+        self.assertEqual(self.hub.app_for(self.one()["id"]), "com.openai.codex", "Open / keys go to ChatGPT.app")
+
+    def test_codex_ignores_old_files(self):
+        self.write({"type": "session_meta", "payload": {"id": "t-1", "cwd": "/x"}})
+        os.utime(self.file, (self.now - 13 * 3600, self.now - 13 * 3600))
+        self.w.poll()
+        self.assertEqual(self.hub.snapshot(), [])
+
+    def test_describe_item(self):
+        self.assertEqual(describe_item({"type": "FileChange", "changes": {"/a/x.py": {}, "/a/y.py": {}}}), "Edit x.py +1")
+        self.assertEqual(describe_item({"type": "McpToolCall", "tool": "search"}), "Tool: search")
+        self.assertIsNone(describe_item({"type": "Reasoning"}))
+
+    def test_app_presence(self):
+        out = {"com.openai.codex": "pid = 1333", "com.anthropic.claudefordesktop": "pid = 1327"}
+
+        def run(argv):
+            if argv[1] == "front":
+                return "ASN:0x0-0x31031:"
+            if argv[3] == "bundleid":
+                return 'bundleID="com.anthropic.claudefordesktop"'
+            return out.get(argv[-1], "")
+        windows = {"error": "Allow Accessibility for MacDeck Windows"}
+        calls, clock = [], [0]
+
+        def read():
+            calls.append(1)
+            return windows
+        apps = AppPresence(self.hub, run=run, windows=read, clock=lambda: clock[0])
+        apps.poll()
+        got = {s["project"]: (s["source"], s["label"], s["summary"]) for s in self.hub.snapshot()}
+        no_ax = "Allow Accessibility for MacDeck Windows"
+        self.assertEqual(got, {"Claude": ("Claude", "Open", "In front · " + no_ax),
+                               "ChatGPT": ("ChatGPT", "Open", "Open · " + no_ax)}, "still listed without permission")
+
+        # 有權限之後：對話名稱、正在回答
+        windows = {"apps": {
+            "com.openai.codex": {"windows": ["Trip plan"], "answering": True, "conversation": ""},
+            "com.anthropic.claudefordesktop": {"windows": ["Claude"], "answering": False,
+                                               "conversation": "Kobo MacDeck 開發規格書"},
+        }}
+        apps.poll()
+        self.assertEqual(len(calls), 1, "waits before retrying after an error")
+        clock[0] = 200
+        apps.poll()
+        got = {s["source"]: (s["project"], s["state"], s["label"], s["summary"]) for s in self.hub.snapshot()}
+        self.assertEqual(got["ChatGPT"], ("Trip plan", "working", "Answering", "Open"))
+        self.assertEqual(got["Claude"], ("Kobo MacDeck 開發規格書", "idle", "Open", "In front"),
+                         "window title is just the app name → use the conversation from the sidebar")
+        clock[0] = 205
+        apps.poll()
+        self.assertEqual(len(calls), 2, "window reader runs at most every 10 s")
+
+        del out["com.openai.codex"]
+        apps.poll()
+        self.assertEqual([s["source"] for s in self.hub.snapshot()], ["Claude"], "closed app disappears")
+
+
+class OldStatusLine(unittest.TestCase):
+    def test_installer_removes_old_macdeck_status_line(self):
+        ours = {"statusLine": {"type": "command", "command": "/x/mac-companion/hooks/macdeck-statusline.sh"}}
+        self.assertNotIn("statusLine", merged(ours), "old MacDeck status line cleaned up")
+        theirs = {"statusLine": {"type": "command", "command": "~/my-line.sh"}}
+        self.assertEqual(merged(theirs)["statusLine"], theirs["statusLine"], "your own status line is kept")
+        self.assertNotIn("statusLine", merged({}), "never adds one")
+
+
 class ClockInfo(unittest.TestCase):
     def test_weather(self):
         urls, now = [], [0]
@@ -170,9 +379,17 @@ class ClockInfo(unittest.TestCase):
                     "daily": {"temperature_2m_max": [22.7], "temperature_2m_min": [8.9]}}
         fetch = lambda url: urls.append(url) or forecast
         cfg = {"weather": {"name": "Ann Arbor", "latitude": 42.28, "longitude": -83.74, "unit": "fahrenheit"}}
-        w = Weather(cfg, fetch=fetch, clock=lambda: now[0])
-        self.assertEqual(w.get(), {"temp": 17, "text": "Overcast", "high": 23, "low": 9, "unit": "F",
+        w = Weather(cfg, fetch=fetch, clock=lambda: now[0], background=False)
+        self.assertEqual(w.get(), {"temp": 17, "text": "Overcast", "icon": "cloudy", "high": 23, "low": 9, "unit": "F",
                                    "location": "Ann Arbor"})
+        from macdeck_companion.info import weather_icon
+        self.assertEqual([weather_icon(c, d) for c, d in ((0, True), (1, False), (2, False), (63, True), (73, True),
+                                                           (95, True), (45, True), (53, True))],
+                         ["clear-day", "clear-night", "partly-night", "rain", "snow", "thunder", "fog", "drizzle"])
+        icons = ROOT / "macdeck.koplugin" / "assets" / "icons"
+        for name in ("clear-day", "clear-night", "partly-day", "partly-night", "cloudy", "fog", "drizzle", "rain",
+                     "snow", "thunder"):
+            self.assertTrue((icons / f"weather-{name}.svg").exists(), name)
         self.assertIn("temperature_unit=fahrenheit", urls[0])
         w.get(); self.assertEqual(len(urls), 1, "cached")
         now[0] = 16 * 60; w.get(); self.assertEqual(len(urls), 2, "refetched after 15 min")
@@ -180,7 +397,17 @@ class ClockInfo(unittest.TestCase):
 
         def down(url):
             raise OSError("offline")
-        self.assertEqual(Weather(cfg, fetch=down).get(), {"error": "Weather unavailable (OSError)"})
+        self.assertEqual(Weather(cfg, fetch=down, background=False).get(), {"error": "Weather unavailable (OSError)"})
+
+        # 已經有資料時，網路斷掉不會把畫面變成錯誤；60 秒後再試
+        w.fetch = down
+        now[0] = 40 * 60
+        self.assertEqual(w.get()["temp"], 17, "keeps the last good weather")
+        now[0] += 30
+        w.fetch = fetch
+        w.get(); self.assertEqual(len(urls), 2, "no retry before 60 s")
+        now[0] += 31
+        w.get(); self.assertEqual(len(urls), 3, "retried after 60 s")
 
     def test_geocode(self):
         place = geocode("ann arbor", fetch=lambda url: {"results": [
@@ -217,7 +444,7 @@ class ClockInfo(unittest.TestCase):
         self.assertEqual(ne.get(), reading)
         gate.set()
         for _ in range(100):
-            if ne.at is not None:
+            if ne.cache.at is not None:
                 break
             th.Event().wait(0.01)
         self.assertEqual(ne.get(), {"event": None})
@@ -225,7 +452,7 @@ class ClockInfo(unittest.TestCase):
         clock[0] = 3 * 60
         ne.get()
         for _ in range(100):
-            if len(calls) == 2 and not ne.busy:
+            if len(calls) == 2 and not ne.cache.busy:
                 break
             th.Event().wait(0.01)
         self.assertEqual(len(calls), 2, "re-read after the cache expires")
@@ -272,14 +499,18 @@ class Server(unittest.TestCase):
 
     def test_chunked_body_rejected(self):
         # LuaSocket 沒帶 Content-Length 時會送 chunked；要明確拒絕而不是讀成空內容
-        import http.client
-        port = self.server.server_address[1]
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        # 用原始 socket 送，伺服器先回 411 再關線時才不會讓測試端 BrokenPipe
+        import socket
         body = json.dumps({"protocol": "macdeck/1", "id": "p1", "type": "ping"}).encode()
-        conn.request("POST", "/command", body=iter([body]), encode_chunked=True,
-                     headers={"Authorization": f"Bearer {TOKEN}", "Transfer-Encoding": "chunked"})
-        self.assertEqual(conn.getresponse().status, 411)
-        conn.close()
+        req = (b"POST /command HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode() +
+               b"\r\nTransfer-Encoding: chunked\r\n\r\n" + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=3) as sock:
+            try:
+                sock.sendall(req)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            status_line = sock.makefile("rb").readline()
+        self.assertIn(b" 411 ", status_line)
 
     def test_hooks_only_on_loopback_listener(self):
         event = {"session_id": "s1", "cwd": "/p/demo", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
@@ -328,6 +559,8 @@ class KoboToCompanion(unittest.TestCase):
         self.server, self.url = start_server()
         self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
         self.lua.execute(f"package.path = {str(ROOT / 'macdeck.koplugin' / '?.lua')!r} .. ';' .. package.path")
+        self.lua.execute("package.preload.logger = function() local n = function() end; "
+                         "return { info = n, dbg = n, warn = n, err = n } end")
 
     def tearDown(self):
         self.server.shutdown()

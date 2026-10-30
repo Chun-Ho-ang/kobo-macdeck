@@ -2,6 +2,7 @@
 -- 和 mock 同介面：connect(on_done(ok, err))、send(action, args, on_ack(ack))、disconnect()
 -- HTTP 是同步的（會擋住 UI 最多 request_timeout_sec），所以一律排到 nextTick，讓按鈕回饋先畫出來
 local Interface = require("transport/interface")
+local logger = require("logger")
 
 local M = {}
 
@@ -74,6 +75,17 @@ end
 
 --- 同步送出一個 envelope；回傳 ack 表。offline = true 代表連不到 Mac（不是 Mac 拒絕指令）
 function Wifi:_post(msg)
+    -- 診斷（debug 等級）：請求前後各記一行；卡住時 log 最後會停在「→」
+    local name = msg.action or msg.type
+    local started = os.clock()
+    logger.dbg("MacDeck wifi: →", name)
+    local ack = self:_postRaw(msg)
+    logger.dbg("MacDeck wifi: ←", name, ack.status, ack.status ~= "ok" and ack.detail or "",
+        string.format("%.0fms cpu", (os.clock() - started) * 1000))
+    return ack
+end
+
+function Wifi:_postRaw(msg)
     local json = self:_json()
     local url = string.format("http://%s:%d/command", self.host, self.port)
     local payload = json.encode(msg)

@@ -111,6 +111,7 @@ end)
 
 -- ── plugin flow ──
 local MacDeck = require("main")
+local ClockScreen = require("ui/clock")
 local function newPlugin()
     return MacDeck:new{ ui = { menu = { registerToMainMenu = function() end } } }
 end
@@ -176,6 +177,38 @@ local function tapCard(screen, project)
     error("card not found: " .. project)
 end
 
+test("media: now playing", function()
+    reset()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Media control"); U:advance(1)
+    local s, scr = p.session, U:top()
+    eq(scr.np_title.text, "▶ 不該 (with 張惠妹)")
+    eq(scr.np_detail.text, "Jay Chou · 1:23 / 4:51")
+
+    tapButton(scr, "Next"); U:advance(1.5)
+    eq(U:top(), scr, "only the now-playing line redraws, not the page")
+    eq(scr.np_title.text, "▶ 晴天", "updated right after Next")
+    tapButton(scr, "Play / Pause"); U:advance(1.5)
+    eq(scr.np_title.text, "Paused · 晴天")
+
+    -- 停在這頁時每 15 秒更新（Mac 那邊自己換歌）
+    s.transport.state.track = 1; s.transport.state.playing = true
+    U:advance(16)
+    eq(scr.np_title.text, "▶ 不該 (with 張惠妹)")
+
+    -- Music 沒開 / 沒在播
+    s.transport.handle = function() return "ok", "closed", { player = "Music", state = "closed" } end
+    U:advance(16)
+    eq(scr.np_title.text, "Music isn't open"); eq(scr.np_detail.text, " ")
+
+    tapButton(scr, "← Back"); U:advance(1)
+    local before = #U.tasks
+    U:advance(60)
+    eq(s.media_poll, nil, "no polling off the Media page")
+    p:teardown(s); eq(#U.tasks, 0)
+end)
+
 test("agents: cards, detail, keys, polling", function()
     reset()
     local p = newPlugin(); p:start()
@@ -187,13 +220,21 @@ test("agents: cards, detail, keys, polling", function()
     assert(c[1].selected and not c[2].selected, "first selected")
     assert(c[2].inverted and not c[1].inverted, "needs-you card is inverted")
     assert(c[4].shaded, "error card is shaded")
-    eq(c[1].lines[2][1], "Working · 2/5")
+    eq(c[1].lines[2][1], "Claude Code · Working · 2/5")
+    eq(c[2].lines[2][1], "Codex · Needs you")
 
     tapCard(scr, "api-server"); scr = U:top()
     eq(s.agent_id, "mock-2"); eq(scr.agent_index, 2)
     tapButton(scr, "Approve"); U:advance(1); scr = U:top()
     eq(s.transport.state.agents[2].state, "working", "approve went to the Mac")
     assert(not scr.agent_cards[2].inverted, "refreshed right after the key")
+
+    -- Dictate：按一下開始（鍵變成 Stop dictation），再按一下停止
+    tapButton(U:top(), "Dictate"); U:advance(1)
+    eq(s.dictating, true); tapButton(U:top(), "Stop dictation"); U:advance(1)
+    eq(s.dictating, false); tapButton(U:top(), "Dictate"); U:advance(1)
+    tapButton(U:top(), "Stop dictation"); U:advance(1)
+    scr = U:top()
 
     -- 資料沒變：輪詢不重畫；有變：重畫
     U:advance(5); eq(U:top(), scr, "no redraw when nothing changed")
@@ -223,6 +264,45 @@ test("agents: cards, detail, keys, polling", function()
     tapButton(U:top(), "Exit → KOReader"); eq(#U.tasks, 0, "polling stopped")
 end)
 
+test("agents: pick which AI to look at", function()
+    reset()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Agents"); U:advance(1)
+    local s, scr = p.session, U:top()
+    -- 預設 4 個 mock：Claude Code 2、Codex 2
+    tapButton(scr, "Codex 2"); scr = U:top()
+    eq(s.agent_filter, "Codex")
+    local shown = {}
+    for _, card in pairs(scr.agent_cards) do shown[#shown + 1] = card.lines[1][1] end
+    table.sort(shown)
+    eq(table.concat(shown, ","), "api-server,infra", "only Codex sessions")
+    tapCard(scr, "infra"); scr = U:top()
+    eq(s.agent_id, "mock-4"); eq(scr.agent_index, 2)
+    tapButton(scr, "Approve"); U:advance(1)
+    eq(p.session.transport.state.agents[4].state, "error", "keys go to the selected Codex session")
+
+    -- 輪詢後篩選和選取都保留
+    s.transport.state.agents[1].summary = "changed"
+    U:advance(5); scr = U:top()
+    eq(s.agent_filter, "Codex"); eq(s.agent_id, "mock-4")
+
+    -- Codex 都結束了 → 自動回到全部
+    table.remove(s.transport.state.agents, 4); table.remove(s.transport.state.agents, 2)
+    U:advance(5); scr = U:top()
+    eq(s.agent_filter, nil); eq(#p:visibleAgents(s), 2)
+    tapButton(scr, "Exit → KOReader"); eq(#U.tasks, 0)
+
+    -- 只有一個來源時不顯示選單
+    reset()
+    Stubs.user_config = { transport = { mock_agent_count = 1 } }
+    p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    tapButton(U:top(), "Agents"); U:advance(1)
+    assert(not pcall(tapButton, U:top(), "All 1"), "no filter row for a single AI")
+    p:teardown(p.session)
+end)
+
 test("agents: variable count, paging, selection by id", function()
     reset()
     Stubs.user_config = { transport = { mock_agent_count = 6 } }
@@ -233,7 +313,10 @@ test("agents: variable count, paging, selection by id", function()
     assert(scr.agent_cards[4] and not scr.agent_cards[5], "page 1 shows 1-4")
     tapButton(scr, "›"); scr = U:top()
     assert(scr.agent_cards[5] and scr.agent_cards[6], "page 2 shows 5-6")
-    tapCard(scr, "project-5")
+    for _, card in pairs(scr.agent_cards) do
+        if card.lines[1][1] == "ChatGPT" then eq(card.lines[2][1], "Open", "app slot: no duplicated name") end
+    end
+    tapCard(scr, "ChatGPT")
     eq(s.agent_id, "mock-5"); eq(U:top().agent_page, 2)
 
     local st = s.transport.state
@@ -277,7 +360,7 @@ test("resume returns to clock; external close tears down", function()
     reset()
     local p = newPlugin(); p:start()
     U:top():onTapClock(); U:advance(1)
-    U:broadcastEvent({ name = "Resume" })
+    U:broadcastEvent({ name = "Resume" }); U:advance(0)
     eq(p.session.machine.state, "CLOCK")
     U:close(U:top())
     eq(p.session, nil); eq(Stubs.Screen.rotation, 0); eq(#U.tasks, 0)
@@ -295,6 +378,12 @@ test("clock refreshes every minute and does periodic full refresh", function()
     p:teardown(p.session); eq(#U.tasks, 0)
 end)
 
+test("fitText shrinks the font instead of cutting the text", function()
+    eq(W.fitText("Mostly clear", 18, false, 108, 12).face.size, 18, "fits as is")
+    eq(W.fitText("Mostly clear", 18, false, 90, 12).face.size, 15, "shrunk until it fits")
+    eq(W.fitText("Mostly clear", 18, false, 30, 12).face.size, 12, "never below the minimum")
+end)
+
 test("clock syncs weather / next event from the Mac", function()
     reset()
     Stubs.user_config = { clock = { sync_min = 15 } }
@@ -303,8 +392,13 @@ test("clock syncs weather / next event from the Mac", function()
     U:advance(1)
     local scr = U:top()
     eq(scr.info.weather.temp, 17)
-    eq(scr:weatherLines()[1][1], "17°C  Overcast")
-    eq(scr:weatherLines()[2][1], "H 23° · L 9° · Ann Arbor")
+    eq(scr:weatherLines()[1][1], "17°C")
+    eq(scr:weatherLines()[2][1], "Overcast")
+    eq(scr:weatherLines()[3][1], "H 23° · L 9°")
+    eq(scr:weatherLines()[4][1], "Ann Arbor")
+    assert(scr.weather_icon and scr.weather_icon.file:match("assets/icons/weather%-cloudy%.svg$"), "weather icon shown")
+    local f = io.open(here .. "/../macdeck.koplugin/assets/icons/weather-cloudy.svg"); assert(f, "icon file exists"); f:close()
+    eq(ClockScreen.weatherIconPath("../../etc/passwd"), nil, "only known icon names")
     eq(scr:eventLines()[1][1], "Design review")
     eq(scr:eventLines()[2][1], "Today 14:00–15:00")
     assert(scr:syncLine():match("^Data: synced "), scr:syncLine())
@@ -347,9 +441,71 @@ test("suspend stops every timer and network call", function()
     eq(s.transport.connected, false)
     U:advance(600)
     eq(#U.tasks, 0, "still nothing after 10 minutes")
-    U:broadcastEvent({ name = "Resume" })
+    U:broadcastEvent({ name = "Resume" }); U:advance(0)
     eq(s.machine.state, "CLOCK", "wakes to the clock")
     p:teardown(s); eq(#U.tasks, 0)
+end)
+
+test("no plugin method looks like a KOReader event handler", function()
+    -- KOReader 會對外掛呼叫 on<Event>(self, ...)；除了 onCloseWidget 之外都不能用這種名字
+    for name, v in pairs(MacDeck) do
+        if type(v) == "function" and name:match("^on%u") then
+            eq(name, "onCloseWidget", "unexpected event-style method")
+        end
+    end
+    reset()
+    local p = newPlugin(); p:start()
+    U:top():onTapClock(); U:advance(1)
+    -- KOReader 把 Suspend 廣播給外掛本身時不會出錯
+    if p.handleEvent then p:handleEvent({ name = "Suspend", args = {} }) end
+    p:teardown(p.session)
+end)
+
+test("closing KOReader restores rotation without broadcasting", function()
+    reset()
+    local p = newPlugin(); p:start()
+    eq(Stubs.Screen.rotation, 1)
+    Stubs.broadcasts = 0
+    p:onCloseWidget()
+    eq(Stubs.broadcasts, 0, "no events into a closing reader")
+    eq(Stubs.Screen.rotation, 0, "rotation restored directly")
+    eq(p.session, nil); eq(#U.tasks, 0)
+end)
+
+test("waking up never loops (KOReader re-sends Resume to newly shown screens)", function()
+    -- 實機曾發生：Resume → 換新時鐘畫面 → 新畫面又收到 Resume → … 卡死
+    for _, page in ipairs({ "clock", "agents" }) do
+        reset()
+        local p = newPlugin(); p:start()
+        if page == "agents" then
+            U:top():onTapClock(); U:advance(1)
+            tapButton(U:top(), "Agents"); U:advance(1)
+        end
+        local s = p.session
+        local enters = 0
+        local orig = p.enter
+        p.enter = function(self, ...) enters = enters + 1; return orig(self, ...) end
+        U:broadcastEvent({ name = "Suspend" })
+        U:broadcastEvent({ name = "Resume" }) -- 舊的測試替身會跳過新畫面；現在和 KOReader 一樣
+        U:advance(0)
+        eq(enters, 1, page .. ": one resume, one state change")
+        eq(#U.stack, 1, page .. ": exactly one MacDeck screen")
+        eq(s.machine.state, "CLOCK")
+        U:broadcastEvent({ name = "Resume" }); U:advance(0)
+        eq(#U.stack, 1, page .. ": resuming again is still fine")
+        p.enter = orig
+        p:teardown(s); eq(#U.tasks, 0)
+    end
+end)
+
+test("state loop safety net exits instead of freezing", function()
+    reset()
+    local p = newPlugin(); p:start()
+    local s = p.session
+    for _ = 1, 60 do p:fire(s, "resume") end -- 同一秒內狂切狀態
+    eq(p.session, nil, "bailed out to KOReader")
+    eq(#U.stack, 0); eq(#U.tasks, 0)
+    Stubs.errors = 0
 end)
 
 test("start twice / keep orientation", function()
@@ -457,10 +613,10 @@ test("wifi: replies after disconnect are dropped", function()
     local p = newPlugin(); p:start()
     U:top():onTapClock(); U:advance(1)
     local t = p.session.transport
-    local got = 0
+    local got, before = 0, fake.requests
     t:send("volume.get", {}, function() got = got + 1 end)
     t:disconnect(); U:advance(1)
-    eq(got, 0); eq(fake.requests, 1, "only the ping went out")
+    eq(got, 0); eq(fake.requests, before, "nothing sent after disconnect")
     p:teardown(p.session)
 end)
 

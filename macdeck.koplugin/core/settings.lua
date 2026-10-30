@@ -34,6 +34,9 @@ M.DEFAULTS = {
         mock_fail_connect = false, -- 設為 true 可測 OFFLINE 畫面（T-05）
         mock_agent_count = 4, -- 假 Claude Code session 數量，用來測分頁
     },
+    media = {
+        poll_sec = 15, -- Media 頁開著時每幾秒更新一次正在播放的歌
+    },
     agents = {
         poll_sec = 5, -- Agents 頁開著時每幾秒問一次 Mac
         stay_open = true, -- Agents 頁不因閒置跳回時鐘（當成桌面狀態板）
@@ -83,6 +86,7 @@ function M.validate(cfg)
     cfg.transport.wifi.request_timeout_sec = clamp(cfg.transport.wifi.request_timeout_sec, 1, 10)
     cfg.transport.mock_agent_count = clamp(math.floor(cfg.transport.mock_agent_count), 0, 12)
     cfg.agents.poll_sec = clamp(cfg.agents.poll_sec, 2, 300)
+    cfg.media.poll_sec = clamp(cfg.media.poll_sec, 5, 300)
     cfg.clock.full_refresh_min = clamp(cfg.clock.full_refresh_min, 0, 24 * 60)
     cfg.clock.sync_min = clamp(math.floor(cfg.clock.sync_min), 0, 24 * 60)
     if cfg.ui.landscape_rotation ~= 1 and cfg.ui.landscape_rotation ~= 3 then

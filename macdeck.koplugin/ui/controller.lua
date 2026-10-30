@@ -21,15 +21,20 @@ local ControllerScreen = W.ScreenBase:extend{
     status = "",
     message = nil, -- OFFLINE 時的錯誤說明
     media = nil, -- { level = 0..100 或 nil, muted = bool }
+    now_playing = nil, -- { state, title, artist, position, duration }；nil = 讀取中
     agents = nil, -- nil = 讀取中；{ { id, project, state, label, summary, progress, elapsed, prompt, step, tasks }, ... }
     agent_index = 1, -- 在完整清單中的位置
     agent_page = 1, -- session 數量不固定，超過一頁就分頁
+    agent_sources = nil, -- { { name, count }, ... }：目前有哪些 AI 在跑
+    agent_filter = nil, -- nil = 全部；否則只顯示這個來源
+    on_agent_filter = nil, -- function(source 或 nil)
     on_activity = nil, -- 任何觸控都呼叫，用來重設閒置逾時
     on_page = nil, -- function(page)
     on_command = nil, -- function(action, args, label)
     on_volume = nil, -- function(level)
     on_select_agent = nil, -- function(index)
     on_agent_key = nil, -- function(key)：approve / stop / send / auto / dictate / open
+    dictating = false, -- Mac 正在聽寫：Dictate 鍵變成「Stop dictation」（黑底）
     on_list_page = nil, -- function(delta)
     on_retry = nil,
     on_clock = nil,
@@ -103,9 +108,40 @@ function ControllerScreen:volumeLabel()
     return string.format("Volume: %d%%", media.level)
 end
 
--- 上半部：上一首 / 播放暫停 / 下一首；下半部：音量條 + 小聲 / 大聲 / 靜音
+local function clockText(sec)
+    sec = math.max(0, math.floor(sec or 0))
+    return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+end
+
+--- 正在播放的兩行文字：「▶ 歌名」與「歌手 · 1:23 / 4:51」
+function ControllerScreen:nowPlayingLines()
+    local np = self.now_playing
+    if not np then return "Now playing: …", "" end
+    if np.state == "closed" then return "Music isn't open", "" end
+    if np.state == "stopped" or not np.title then return "Nothing playing", "" end
+    local mark = np.state == "paused" and "Paused · " or "▶ "
+    local detail = np.artist or ""
+    if (np.duration or 0) > 0 then
+        detail = string.format("%s%s%s / %s", detail, detail ~= "" and " · " or "", clockText(np.position),
+            clockText(np.duration))
+    end
+    return mark .. np.title, detail
+end
+
+-- 最上面：正在播放；中間：上一首 / 播放暫停 / 下一首；下半部：音量條 + 小聲 / 大聲 / 靜音
 function ControllerScreen:buildMedia(width, height)
     local m = W.metrics()
+    local title, detail = self:nowPlayingLines()
+    self.np_title = W.text(title, 20, true, width)
+    self.np_detail = W.text(detail ~= "" and detail or " ", 14, false, width)
+    local np_h = math.floor(m.header_h * 1.8)
+    self.now_playing_region = W.Region:new{
+        LeftContainer:new{
+            dimen = Geom:new{ w = width, h = np_h },
+            VerticalGroup:new{ align = "left", self.np_title, self.np_detail },
+        },
+    }
+    height = height - np_h - m.gap
     local top_h = math.floor((height - m.gap) * 0.58)
     local label_h = m.header_h
     local bar_h = height - top_h - 2 * m.gap - label_h
@@ -150,6 +186,8 @@ function ControllerScreen:buildMedia(width, height)
 
     return VerticalGroup:new{
         align = "left",
+        self.now_playing_region,
+        VerticalSpan:new{ width = m.gap },
         top,
         VerticalSpan:new{ width = m.gap },
         self.volume_label,
@@ -167,7 +205,9 @@ function ControllerScreen:buildMedia(width, height)
 end
 
 function ControllerScreen:agentCard(a, w, h, index)
+    -- 第二行：來源 · 狀態 · 進度，例如「Codex · Working · 2/5」
     local state = a.label or a.state or ""
+    if a.source and a.source ~= "" and a.source ~= a.project then state = a.source .. " · " .. state end
     if a.progress and a.progress ~= "" then state = state .. " · " .. a.progress end
     return W.Card:new{
         width = w,
@@ -195,7 +235,9 @@ function ControllerScreen:agentDetail(a, w, h)
         return t
     end
     add(a.project or "session", 18, true)
-    add(string.format("%s · %s", a.label or "", a.elapsed or ""), 14)
+    local meta = string.format("%s · %s", a.label or "", a.elapsed or "")
+    if a.source and a.source ~= "" then meta = a.source .. " · " .. meta end
+    add(meta, 14)
     if a.prompt and a.prompt ~= "" then add("“" .. a.prompt .. "”", 14) end
     table.insert(group, VerticalSpan:new{ width = m.gap })
     used = used + m.gap
@@ -218,8 +260,8 @@ function ControllerScreen:agentDetail(a, w, h)
         local t = tasks[i]
         add((TASK_MARK[t.status] or "○") .. "  " .. (t.text or ""), 14, t.status == "in_progress")
     end
-    if #tasks == 0 then add("No task list", 14) end
-    if footer_h > 0 then
+    if #tasks == 0 then add((a.source == "ChatGPT" or a.source == "Claude") and "No status from this app" or "No task list", 14) end
+    if a.step and a.step ~= "" then
         table.insert(group, VerticalSpan:new{ width = m.gap })
         add("Now: " .. a.step, 14)
     end
@@ -232,14 +274,36 @@ function ControllerScreen:buildAgents(width, height)
     local agents = self.agents
     if agents == nil or #agents == 0 then
         local group = VerticalGroup:new{ align = "center" }
-        table.insert(group, W.text(agents == nil and "Looking for Claude Code sessions…" or "No active sessions",
+        table.insert(group, W.text(agents == nil and "Looking for agent sessions…" or "No active sessions",
             22, true, width - 4 * m.pad))
         if agents ~= nil then
             table.insert(group, VerticalSpan:new{ width = m.gap })
-            table.insert(group, W.text("Start Claude Code on the Mac with the MacDeck hooks installed", 14, false,
+            table.insert(group, W.text("Open Claude Code, Codex, ChatGPT or Claude on the Mac", 14, false,
                 width - 4 * m.pad))
         end
         return W.tile(width, height, group, { center = true })
+    end
+
+    -- 同時有多個 AI 時，最上面一列選要看哪一個（只有一個來源就不佔空間）
+    local sources = self.agent_sources or {}
+    local filter_row
+    if #sources > 1 or self.agent_filter then
+        local total = 0
+        for _, src in ipairs(sources) do total = total + src.count end
+        local specs = { {
+            text = string.format("All %d", total), font_size = 16, selected = self.agent_filter == nil,
+            callback = self:tap(self.on_agent_filter, nil),
+        } }
+        for _, src in ipairs(sources) do
+            table.insert(specs, {
+                text = string.format("%s %d", src.name, src.count), font_size = 16,
+                selected = self.agent_filter == src.name,
+                callback = self:tap(self.on_agent_filter, src.name),
+            })
+        end
+        local filter_h = math.floor(m.footer_h * 0.7)
+        filter_row = W.buttonRow(specs, width, filter_h, self, self.cfg.ui.feedback_ms)
+        height = height - filter_h - m.gap
     end
 
     local keys_h = m.footer_h
@@ -284,8 +348,8 @@ function ControllerScreen:buildAgents(width, height)
     end
 
     local current = agents[self.agent_index] or agents[1]
-    local function key(text, name)
-        return { text = text, font_size = 16, callback = self:tap(self.on_agent_key, name) }
+    local function key(text, name, selected)
+        return { text = text, font_size = 16, selected = selected, callback = self:tap(self.on_agent_key, name) }
     end
     -- Dictate 比較寬，和 Codex Micro 的長鍵一樣
     local unit = math.floor((width - 5 * m.gap) / 6.6)
@@ -295,23 +359,27 @@ function ControllerScreen:buildAgents(width, height)
     local keys = HorizontalGroup:new{
         W.buttonRow(small, 4 * unit + 3 * m.gap, keys_h, self, self.cfg.ui.feedback_ms),
         HorizontalSpan:new{ width = m.gap },
-        W.buttonRow({ key("Dictate", "dictate") }, math.floor(unit * 1.6), keys_h, self, self.cfg.ui.feedback_ms),
+        W.buttonRow({ self.dictating and key("Stop dictation", "dictate", true) or key("Dictate", "dictate") },
+            math.floor(unit * 1.6), keys_h, self, self.cfg.ui.feedback_ms),
         HorizontalSpan:new{ width = m.gap },
         W.buttonRow({ key("Send", "send") }, width - 4 * unit - 5 * m.gap - math.floor(unit * 1.6), keys_h,
             self, self.cfg.ui.feedback_ms),
     }
 
-    return VerticalGroup:new{
-        align = "left",
-        HorizontalGroup:new{
-            align = "top",
-            grid,
-            HorizontalSpan:new{ width = m.gap },
-            self:agentDetail(current, right_w, main_h),
-        },
-        VerticalSpan:new{ width = m.gap },
-        keys,
-    }
+    local body = VerticalGroup:new{ align = "left" }
+    if filter_row then
+        table.insert(body, filter_row)
+        table.insert(body, VerticalSpan:new{ width = m.gap })
+    end
+    table.insert(body, HorizontalGroup:new{
+        align = "top",
+        grid,
+        HorizontalSpan:new{ width = m.gap },
+        self:agentDetail(current, right_w, main_h),
+    })
+    table.insert(body, VerticalSpan:new{ width = m.gap })
+    table.insert(body, keys)
+    return body
 end
 
 function ControllerScreen:buildMessage(width, height)
@@ -394,6 +462,16 @@ end
 function ControllerScreen:setResult(text)
     self.result_text:setText(text)
     UIManager:setDirty(self, function() return "ui", self.result_region.dimen end)
+end
+
+--- Media 頁：更新正在播放（只刷新那一塊）
+function ControllerScreen:setNowPlaying(np)
+    self.now_playing = np
+    if not self.np_title then return end
+    local title, detail = self:nowPlayingLines()
+    self.np_title:setText(title)
+    self.np_detail:setText(detail ~= "" and detail or " ")
+    UIManager:setDirty(self, function() return "ui", self.now_playing_region.dimen end)
 end
 
 --- Media 頁：更新音量條與文字（只刷新那兩塊）

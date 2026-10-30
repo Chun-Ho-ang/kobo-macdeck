@@ -48,6 +48,19 @@ function W.text(text, size, bold, max_width)
     }
 end
 
+--- 整行一定要完整顯示時用：從 size 開始往下縮，直到寬度 ≤ max_width（最小 min_size，再不行才截斷）
+function W.fitText(text, size, bold, max_width, min_size)
+    min_size = min_size or 12
+    while size > min_size do
+        local probe = TextWidget:new{ text = text, face = Font:getFace("cfont", size), bold = bold }
+        local fits = probe:getSize().w <= max_width
+        probe:free()
+        if fits then break end
+        size = size - 1
+    end
+    return W.text(text, size, bold, max_width)
+end
+
 -- 記錄自己實際被畫在哪裡，供 setDirty 局部刷新使用
 W.Region = WidgetContainer:extend{}
 

@@ -10,11 +10,13 @@ import secrets
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .actions import ActionError, Actions
 from .agents import AgentHub
+from .sources import start_watchers
 from .protocol import Deduper, ProtocolError, ack, parse_command
 
 log = logging.getLogger("macdeck")
@@ -127,7 +129,11 @@ def make_handler(actions: Actions, deduper: Deduper, token: str, hub: AgentHub =
                     reply = ack(msg["id"], "error", str(e))
             deduper.put(msg["id"], reply)
             if msg.get("action") not in QUIET_ACTIONS or reply["status"] != "ok":
-                log.info("%s %s -> %s", msg["id"], msg.get("action", "ping"), reply["status"])
+                # 錯誤時連原因一起記（原因是我們自己產生的說明，不含使用者內容）
+                # agent 按鍵成功時也記是哪一顆、按到哪個按鈕（例如「approve: Allow」），方便確認
+                show = reply["status"] != "ok" or msg.get("action") in ("agent.key", "agent.open")
+                why = f" ({reply.get('detail')})" if show else ""
+                log.info("%s %s -> %s%s", msg["id"], msg.get("action", "ping"), reply["status"], why)
             self._reply(200, reply)
 
         def _hook(self):
@@ -166,7 +172,17 @@ def main():
     token = load_token(a.token_file)
     write_hook_auth(token, a.token_file)
     hub = AgentHub()
-    actions = Actions(load_config(a.config), dry_run=not a.live, hub=hub)
+    config = load_config(a.config)
+    actions = Actions(config, dry_run=not a.live, hub=hub)
+    start_watchers(hub, config)  # Codex 的 session 檔、ChatGPT / Claude App 是否開著
+
+    # 天氣和行事曆：啟動就先抓，之後每分鐘檢查一次，Kobo 來問時一律有現成的資料
+    def keep_info_fresh():
+        while True:
+            actions.weather.get()
+            actions.calendar.get()
+            time.sleep(60)
+    threading.Thread(target=keep_info_fresh, name="macdeck-info", daemon=True).start()
     deduper = Deduper()
     loopback = ipaddress.ip_address(host).is_loopback
     server = ThreadingHTTPServer((host, a.port), make_handler(actions, deduper, token, hub, hooks=loopback))

@@ -27,7 +27,7 @@ local Mock = {}
 Mock.__index = Mock
 
 local MOCK_AGENTS = {
-    { project = "kobo-macdeck", state = "working", label = "Working", summary = "Edit wifi.lua", progress = "2/5",
+    { source = "Claude Code", project = "kobo-macdeck", state = "working", label = "Working", summary = "Edit wifi.lua", progress = "2/5",
       elapsed = "4m 12s", prompt = "Add Wi-Fi transport", step = "Edit transport/wifi.lua",
       tasks = {
           { text = "Read transport and server", status = "completed" },
@@ -36,12 +36,19 @@ local MOCK_AGENTS = {
           { text = "Add tests", status = "pending" },
           { text = "Update README", status = "pending" },
       } },
-    { project = "api-server", state = "waiting", label = "Needs you", summary = "Allow Run: npm test?", progress = "",
+    { source = "Codex", project = "api-server", state = "waiting", label = "Needs you", summary = "Allow Run: npm test?", progress = "",
       elapsed = "1m 03s", prompt = "Fix the failing login test", step = "Run: npm test", tasks = {} },
-    { project = "blog", state = "done", label = "Done", summary = "12 min ago", progress = "3/3",
+    { source = "Claude Code", project = "blog", state = "done", label = "Done", summary = "12 min ago", progress = "3/3",
       elapsed = "6m 40s", prompt = "Write the October post", step = "", tasks = {} },
-    { project = "infra", state = "error", label = "Error", summary = "rate_limit", progress = "",
+    { source = "Codex", project = "infra", state = "error", label = "Error", summary = "rate_limit", progress = "",
       elapsed = "0m 20s", prompt = "Bump Terraform providers", step = "", tasks = {} },
+    { source = "ChatGPT", project = "ChatGPT", state = "idle", label = "Open", summary = "In front", progress = "",
+      elapsed = "0s", prompt = "", step = "", tasks = {} },
+}
+
+local MOCK_TRACKS = {
+    { "不該 (with 張惠妹)", "Jay Chou", 291 },
+    { "晴天", "Jay Chou", 269 },
 }
 
 local function copy(v)
@@ -54,7 +61,7 @@ end
 local function mockAgents(count)
     local list = {}
     for i = 1, count do
-        local a = copy(MOCK_AGENTS[i] or { project = "project-" .. i, state = "done", label = "Done",
+        local a = copy(MOCK_AGENTS[i] or { source = "Claude Code", project = "project-" .. i, state = "done", label = "Done",
             summary = "1 h ago", progress = "", elapsed = "2m 00s", prompt = "", step = "", tasks = {} })
         a.id = "mock-" .. i
         list[i] = a
@@ -73,6 +80,8 @@ function M.mock(opts)
             volume = 50,
             muted = false,
             agents = mockAgents(opts.agent_count or 4),
+            track = 1,
+            playing = true,
         },
     }, Mock)
 end
@@ -86,7 +95,14 @@ end
 function Mock:handle(action, args)
     local st = self.state
     if action == "media.previous" or action == "media.toggle" or action == "media.next" then
+        if action == "media.next" then st.track = st.track % #MOCK_TRACKS + 1 end
+        if action == "media.previous" then st.track = (st.track - 2) % #MOCK_TRACKS + 1 end
+        if action == "media.toggle" then st.playing = not st.playing end
         return "ok", action .. " (mock)"
+    elseif action == "media.now" then
+        local t = MOCK_TRACKS[st.track]
+        return "ok", "now playing", { player = "Music", state = st.playing and "playing" or "paused",
+            title = t[1], artist = t[2], position = 83, duration = t[3] }
     elseif action == "volume.get" then
         return "ok", "volume", { level = st.volume, muted = st.muted }
     elseif action == "volume.set" then
@@ -99,7 +115,8 @@ function Mock:handle(action, args)
         return "ok", st.muted and "muted" or "unmuted", { level = st.volume, muted = st.muted }
     elseif action == "info.get" then
         return "ok", "info", {
-            weather = { temp = 17, text = "Overcast", high = 23, low = 9, unit = "C", location = "Ann Arbor" },
+            weather = { temp = 17, text = "Overcast", icon = "cloudy", high = 23, low = 9, unit = "C",
+                location = "Ann Arbor" },
             event = { title = "Design review", when = "Today 14:00–15:00", location = "Room 3" },
             synced = os.date("%H:%M"),
         }
@@ -110,6 +127,10 @@ function Mock:handle(action, args)
             if a.id == args.session_id then
                 if action == "agent.key" and args.key == "approve" and a.state == "waiting" then
                     a.state, a.label, a.summary = "working", "Working", a.step
+                end
+                if action == "agent.key" and args.key == "dictate" then
+                    st.dictating = not st.dictating
+                    return "ok", "dictate (mock)", { dictating = st.dictating }
                 end
                 return "ok", (args.key or "opened") .. " (mock)"
             end

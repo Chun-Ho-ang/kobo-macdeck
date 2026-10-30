@@ -4,22 +4,18 @@ Both are read-only and cached, so the Kobo can ask as often as it likes.
 """
 
 import json
-import platform
-import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Callable, Optional
+
+from . import helper_apps
 
 WEATHER_TTL = 15 * 60
 EVENT_TTL = 2 * 60
-HELPERS = Path(__file__).resolve().parent.parent / "helpers"
-MIN_MACOS = "14.0"  # 和 helpers/Info.plist 的 LSMinimumSystemVersion 一致
 
 # WMO weather codes → short English text (fits the Kobo tile)
 WMO = {
@@ -31,6 +27,27 @@ WMO = {
     80: "Showers", 81: "Showers", 82: "Heavy showers", 85: "Snow showers", 86: "Snow showers",
     95: "Thunderstorm", 96: "Thunderstorm", 99: "Thunderstorm",
 }
+
+
+def weather_icon(code: int, is_day: bool = True) -> str:
+    """WMO code → icon name on the Kobo (macdeck.koplugin/assets/icons/weather-<name>.svg)."""
+    if code in (0, 1):
+        return "clear-day" if is_day else "clear-night"
+    if code == 2:
+        return "partly-day" if is_day else "partly-night"
+    if code == 3:
+        return "cloudy"
+    if code in (45, 48):
+        return "fog"
+    if 51 <= code <= 57:
+        return "drizzle"
+    if 61 <= code <= 67 or 80 <= code <= 82:
+        return "rain"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snow"
+    if code >= 95:
+        return "thunder"
+    return "cloudy"
 
 
 class InfoError(Exception):
@@ -54,42 +71,72 @@ def geocode(name: str, fetch: Callable[[str], dict] = fetch_json) -> dict:
     return {"name": r["name"], "label": label, "latitude": r["latitude"], "longitude": r["longitude"]}
 
 
-class Cached:
-    def __init__(self, ttl: float, clock: Callable[[], float]):
-        self.ttl, self.clock = ttl, clock
-        self.value, self.at = None, None
-        self.lock = threading.Lock()
+LOAD_ERRORS = (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError)
 
-    def get(self, load: Callable[[], dict]) -> dict:
+
+class Background:
+    """A value kept fresh in the background.
+
+    get() never waits: it returns the last value right away and, if that's older than ttl, starts
+    a refresh. A failed refresh keeps the last good value (retrying after `retry` seconds), so a
+    slow network or a busy calendar never blanks the Kobo.
+    """
+
+    def __init__(self, load: Callable[[], dict], ttl: float, initial: dict, describe: Callable[[Exception], str],
+                 clock=time.time, background: bool = True, retry: float = 60):
+        self.load, self.ttl, self.describe = load, ttl, describe
+        self.clock, self.background, self.retry = clock, background, retry
+        self.lock = threading.Lock()
+        self.value, self.at, self.busy = initial, None, False
+
+    def get(self) -> dict:
+        with self.lock:
+            stale = self.at is None or self.clock() - self.at >= self.ttl
+            start = stale and not self.busy
+            if start:
+                self.busy = True
+        if start:
+            if self.background:
+                threading.Thread(target=self._refresh, daemon=True).start()
+            else:
+                self._refresh()
+        with self.lock:
+            return self.value
+
+    def _refresh(self) -> None:
+        try:
+            value, ok = self.load(), True
+        except LOAD_ERRORS + (InfoError,) as e:
+            value, ok = {"error": self.describe(e)}, False
         with self.lock:
             now = self.clock()
-            if self.at is None or now - self.at >= self.ttl:
-                self.value, self.at = load(), now
-            return self.value
+            if ok or "error" in self.value:
+                self.value = value  # 失敗時保留上一次成功的資料
+            self.at = now if ok else now - self.ttl + self.retry
+            self.busy = False
 
 
 class Weather:
-    def __init__(self, config: dict, fetch: Callable[[str], dict] = fetch_json, clock=time.time):
+    def __init__(self, config: dict, fetch: Callable[[str], dict] = fetch_json, clock=time.time,
+                 background: bool = True):
         w = config.get("weather") if isinstance(config.get("weather"), dict) else {}
         self.lat, self.lon = w.get("latitude"), w.get("longitude")
         self.name = str(w.get("name") or "")
         self.fahrenheit = w.get("unit") == "fahrenheit"
         self.fetch = fetch
-        self.cache = Cached(WEATHER_TTL, clock)
+        # 背景抓：Kobo 只等 3 秒，不能在回應裡現場上網（最多 8 秒）
+        self.cache = Background(self._load, WEATHER_TTL, {"error": "Loading weather…"},
+                                lambda e: f"Weather unavailable ({type(e).__name__})", clock, background)
 
     def get(self) -> dict:
         if not isinstance(self.lat, (int, float)) or not isinstance(self.lon, (int, float)):
             return {"error": "Set a location on the Mac"}
-        try:
-            return self.cache.get(self._load)
-        except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
-            self.cache.at = None  # 下次再試
-            return {"error": f"Weather unavailable ({type(e).__name__})"}
+        return self.cache.get()
 
     def _load(self) -> dict:
         q = {
             "latitude": self.lat, "longitude": self.lon, "timezone": "auto", "forecast_days": 1,
-            "current": "temperature_2m,weather_code", "daily": "temperature_2m_max,temperature_2m_min",
+            "current": "temperature_2m,weather_code,is_day", "daily": "temperature_2m_max,temperature_2m_min",
         }
         if self.fahrenheit:
             q["temperature_unit"] = "fahrenheit"
@@ -98,6 +145,7 @@ class Weather:
         return {
             "temp": round(cur["temperature_2m"]),
             "text": WMO.get(cur["weather_code"], "—"),
+            "icon": weather_icon(cur["weather_code"], cur.get("is_day", 1) == 1),
             "high": round(daily["temperature_2m_max"][0]),
             "low": round(daily["temperature_2m_min"][0]),
             "unit": "F" if self.fahrenheit else "C",
@@ -121,42 +169,18 @@ def when_label(start: float, end: float, now: datetime) -> str:
 class NextEvent:
     """Runs helpers/next_event.swift as its own app (MacDeck Calendar.app), so macOS asks for
     Calendar access in that app's name no matter which terminal started the Companion.
-
-    Reading happens in the background: the Kobo gets the last result right away and never waits
-    for the first compile or for you to answer the permission prompt.
-    """
+    Read in the background (see Background)."""
 
     def __init__(self, run: Optional[Callable[[], str]] = None, clock=time.time, now=datetime.now,
                  background: bool = True):
         self.run = run or self._run_helper
-        self.clock, self.now = clock, now
-        self.background = background
-        self.lock = threading.Lock()
-        self.value: dict = {"error": "Reading calendar…"}
-        self.at: Optional[float] = None
-        self.busy = False
+        self.now = now
+        self.cache = Background(self._load, EVENT_TTL, {"error": "Reading calendar…"},
+                                lambda e: str(e) if isinstance(e, InfoError) else f"Calendar unavailable ({type(e).__name__})",
+                                clock, background)
 
     def get(self) -> dict:
-        with self.lock:
-            stale = self.at is None or self.clock() - self.at >= EVENT_TTL
-            start = stale and not self.busy
-            if start:
-                self.busy = True
-        if start:
-            if self.background:
-                threading.Thread(target=self._refresh, daemon=True).start()
-            else:
-                self._refresh()
-        with self.lock:
-            return self.value
-
-    def _refresh(self) -> None:
-        try:
-            value = self._load()
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError, InfoError) as e:
-            value = {"error": str(e) if isinstance(e, InfoError) else f"Calendar unavailable ({type(e).__name__})"}
-        with self.lock:
-            self.value, self.at, self.busy = value, self.clock(), False
+        return self.cache.get()
 
     def _load(self) -> dict:
         d = json.loads(self.run())
@@ -174,25 +198,6 @@ class NextEvent:
 
     @staticmethod
     def _run_helper() -> str:
-        src = HELPERS / "next_event.swift"
-        plist = HELPERS / "Info.plist"
-        app = HELPERS / ".build" / "MacDeck Calendar.app"
-        exe = app / "Contents" / "MacOS" / "next-event"
-        if not exe.exists() or exe.stat().st_mtime < max(src.stat().st_mtime, plist.stat().st_mtime):
-            exe.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(plist, app / "Contents" / "Info.plist")
-            # 明確指定最低系統版本：swiftc 預設可能跟著 SDK 標成比這台 Mac 還新的版本，LaunchServices 會拒絕啟動（-10825）
-            target = f"{platform.machine()}-apple-macos{MIN_MACOS}"
-            subprocess.run(["swiftc", "-O", "-target", target, str(src), "-o", str(exe)],
-                           check=True, timeout=300, capture_output=True)
-            # 簽成一個完整的 App（ad-hoc），macOS 才會用 bundle id 記住你給的權限
-            subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True, timeout=60,
-                           capture_output=True)
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "events.json"
-            # -n 新開一份、-W 等它結束、-g -j 不搶前景也不顯示；第一次會等你回答權限詢問
-            subprocess.run(["open", "-n", "-W", "-g", "-j", str(app), "--args", str(out)],
-                           check=True, timeout=180, capture_output=True)
-            if not out.exists():
-                raise InfoError("Calendar helper didn't answer")
-            return out.read_text()
+        app = helper_apps.build("MacDeck Calendar", "next_event.swift", "Info.plist", "next-event")
+        out = helper_apps.run(app, timeout=180)  # 第一次會等你回答權限詢問
+        return out

@@ -18,6 +18,8 @@ EVENTS = (
     "Notification", "Stop", "StopFailure", "TaskCreated", "TaskCompleted", "SessionEnd",
 )
 SCRIPT = (Path(__file__).resolve().parent.parent / "hooks" / "macdeck-hook.sh")
+# 舊版會裝的 status line（用量功能已移除）；--apply / --remove 時順手清掉
+OLD_STATUSLINE = "macdeck-statusline.sh"
 
 
 def is_ours(group: dict) -> bool:
@@ -37,6 +39,9 @@ def merged(settings: dict, remove: bool = False) -> dict:
             hooks.pop(event, None)
     if not hooks:
         out.pop("hooks")
+    line = out.get("statusLine")
+    if isinstance(line, dict) and str(line.get("command", "")).endswith("/" + OLD_STATUSLINE):
+        out.pop("statusLine")  # 只清我們自己的；你自己的 status line 不動
     return out
 
 
@@ -55,6 +60,8 @@ def main():
     if not (a.apply or a.remove):
         print(f"Would update {a.settings} so these events run {SCRIPT}:")
         print("  " + ", ".join(EVENTS))
+        if "statusLine" in current and "statusLine" not in new:
+            print("and remove the old MacDeck status line")
         print("Run again with --apply to write it.")
         return
     if a.settings.exists():

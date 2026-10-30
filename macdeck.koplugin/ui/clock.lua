@@ -5,6 +5,7 @@ local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
+local ImageWidget = require("ui/widget/imagewidget")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -22,6 +23,19 @@ local ClockScreen = W.ScreenBase:extend{
 }
 
 local font_size_cache = {}
+
+-- 插件資料夾（天氣圖示在 assets/icons/weather-<name>.svg）
+local PLUGIN_DIR = (debug.getinfo(1, "S").source:match("^@(.*)/ui/[^/]+%.lua$")) or "plugins/macdeck.koplugin"
+local ICONS = {
+    ["clear-day"] = true, ["clear-night"] = true, ["partly-day"] = true, ["partly-night"] = true,
+    cloudy = true, fog = true, drizzle = true, rain = true, snow = true, thunder = true,
+}
+
+--- 天氣圖示的檔案路徑；不認得的名稱回傳 nil（不顯示圖示）
+function ClockScreen.weatherIconPath(name)
+    if not ICONS[name] then return nil end
+    return string.format("%s/assets/icons/weather-%s.svg", PLUGIN_DIR, name)
+end
 
 -- 找出能塞進 w×h 的最大時間字級（以最寬的 "88:88" 量測）
 local function timeFontSize(w, h)
@@ -62,11 +76,14 @@ function ClockScreen:weatherLines()
     if not w then return { { "—", 18 } } end
     if w.error then return { { w.error, 14 } } end
     local deg = "°" .. (w.unit or "")
-    local where = (w.location and w.location ~= "") and (" · " .. w.location) or ""
-    return {
-        { string.format("%d%s  %s", w.temp or 0, deg, w.text or ""), 22, true },
-        { string.format("H %d° · L %d°%s", w.high or 0, w.low or 0, where), 14 },
+    -- 第 4 欄 = 最小字級：放不下就縮字，不截斷（例如「Mostly clear」）
+    local lines = {
+        { string.format("%d%s", w.temp or 0, deg), 28, true, 18 },
+        { w.text or "", 18, false, 12 },
+        { string.format("H %d° · L %d°", w.high or 0, w.low or 0), 14, false, 11 },
     }
+    if w.location and w.location ~= "" then table.insert(lines, { w.location, 14, false, 11 }) end
+    return lines
 end
 
 function ClockScreen:eventLines()
@@ -122,23 +139,45 @@ function ClockScreen:init()
 
     local tile_h = math.floor((body_h - m.gap) / 2)
     local info_w = right_w - 2 * m.pad - 2 * m.border
-    -- lines = { { text, size, bold }, ... }
-    local function infoTile(title, lines, h)
+    -- lines = { { text, size, bold }, ... }；icon = 圖示檔路徑（放在文字左邊）
+    local function infoTile(title, lines, h, icon)
+        local icon_size = icon and math.floor((h - 2 * m.border) * 0.62) or 0
+        local text_w = icon and (info_w - icon_size - m.pad) or info_w
         local group = VerticalGroup:new{
             align = "left",
             W.text(title, 14, true, info_w),
             VerticalSpan:new{ width = math.floor(m.gap / 2) },
         }
-        for _, l in ipairs(lines) do table.insert(group, W.text(l[1], l[2] or 16, l[3], info_w)) end
+        local text = VerticalGroup:new{ align = "left" }
+        for _, l in ipairs(lines) do
+            if l[4] then
+                table.insert(text, W.fitText(l[1], l[2] or 16, l[3], text_w, l[4]))
+            else
+                table.insert(text, W.text(l[1], l[2] or 16, l[3], text_w))
+            end
+        end
+        if icon then
+            self.weather_icon = ImageWidget:new{ file = icon, width = icon_size, height = icon_size, alpha = true }
+            table.insert(group, HorizontalGroup:new{
+                align = "center",
+                self.weather_icon,
+                HorizontalSpan:new{ width = m.pad },
+                text,
+            })
+        else
+            table.insert(group, text)
+        end
         return W.tile(right_w, h, group)
     end
+    local weather = self.info and self.info.weather
 
     local body = HorizontalGroup:new{
         align = "top",
         W.tile(left_w, body_h, left_content),
         HorizontalSpan:new{ width = m.gap },
         VerticalGroup:new{
-            infoTile("WEATHER", self:weatherLines(), tile_h),
+            infoTile("WEATHER", self:weatherLines(), tile_h,
+                weather and not weather.error and ClockScreen.weatherIconPath(weather.icon)),
             VerticalSpan:new{ width = m.gap },
             infoTile("NEXT EVENT", self:eventLines(), body_h - m.gap - tile_h),
         },

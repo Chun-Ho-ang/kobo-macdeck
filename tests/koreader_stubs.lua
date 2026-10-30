@@ -37,7 +37,11 @@ function WidgetContainer:handleEvent(ev)
 end
 
 local TextWidget = Widget:extend{}
-function TextWidget:getSize() return { w = #self.text * 10, h = 20 } end
+-- 寬度跟字級成正比（每個位元組 = 字級的一半），讓「放不下就縮字」的邏輯測得到
+function TextWidget:getSize()
+    local size = self.face and self.face.size or 20
+    return { w = #self.text * size / 2, h = size }
+end
 function TextWidget:setText(t) self.text = t end
 function TextWidget:getFontSizeToFitHeight(_, h) return h end
 
@@ -70,9 +74,25 @@ function U:close(w)
 end
 function U:top() return self.stack[#self.stack] end
 function U:setDirty() self.dirty = self.dirty + 1 end
+-- 和 KOReader 的 UIManager:broadcastEvent 一樣：每處理完一個視窗就從最上層重新找，
+-- 處理途中新 show 的視窗也會收到同一個事件（MacDeck 曾因此在 Resume 時無限迴圈）
 function U:broadcastEvent(ev)
+    Stubs.broadcasts = (Stubs.broadcasts or 0) + 1
     if ev.name == "SetRotationMode" then Stubs.Screen.rotation = ev.args[1] end
-    for _, w in ipairs(self.stack) do w:handleEvent(ev) end
+    local checked, guard = {}, 0
+    local i = #self.stack
+    while i > 0 do
+        guard = guard + 1
+        if guard > 1000 then error("broadcastEvent(" .. tostring(ev.name) .. ") never finished: event loop") end
+        local w = self.stack[i]
+        if not checked[w] then
+            checked[w] = true
+            w:handleEvent(ev)
+            i = #self.stack
+        else
+            i = i - 1
+        end
+    end
 end
 
 Stubs.Screen = {
@@ -81,6 +101,7 @@ Stubs.Screen = {
     DEVICE_ROTATED_UPSIDE_DOWN = 2, DEVICE_ROTATED_COUNTER_CLOCKWISE = 3,
 }
 function Stubs.Screen:getRotationMode() return self.rotation end
+function Stubs.Screen:setRotationMode(mode) self.rotation = mode end
 function Stubs.Screen:getWidth() return (self.rotation % 2 == 1) and 1448 or 1072 end
 function Stubs.Screen:getHeight() return (self.rotation % 2 == 1) and 1072 or 1448 end
 function Stubs.Screen:scaleBySize(n) return n * 2 end
@@ -105,7 +126,8 @@ function Stubs.install()
     }) do
         P[m] = function() return WidgetContainer:extend{} end
     end
-    for _, m in ipairs({ "ui/widget/horizontalspan", "ui/widget/verticalspan", "ui/widget/linewidget" }) do
+    for _, m in ipairs({ "ui/widget/horizontalspan", "ui/widget/verticalspan", "ui/widget/linewidget",
+        "ui/widget/imagewidget" }) do
         P[m] = function() return Widget:extend{} end
     end
     P["logger"] = function() return { err = function(...) Stubs.errors = (Stubs.errors or 0) + 1; print("logger.err", ...) end, dbg = function() end, info = function() end } end
